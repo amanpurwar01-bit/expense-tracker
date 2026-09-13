@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
+import re
 from sqlalchemy import create_engine, text
+import pdfplumber
 
 # Connect to cloud database via Streamlit Secrets
 engine = create_engine(st.secrets["DATABASE_URL"])
@@ -18,70 +20,122 @@ CATEGORIES = [
     "Savings", "Sent to India", "Health", "Misc"
 ]
 
+def parse_pdf_statement(file):
+    """Extracts transaction rows from bank and credit card statement PDFs."""
+    records = []
+    date_regex = re.compile(
+        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{1,2}[/-]\d{1,2}|\d{4}[/-]\d{2}[/-]\d{2})",
+        re.IGNORECASE
+    )
+    amount_regex = re.compile(r"[\$]?(\d{1,3}(?:,\d{3})*\.\d{2})\s*$")
+
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            table_found = False
+            for table in tables:
+                for row in table:
+                    clean_row = [str(cell).strip() for cell in row if cell is not None]
+                    if len(clean_row) >= 3:
+                        d_match = date_regex.match(clean_row[0])
+                        a_match = re.search(r"(\d+\.\d{2})", clean_row[-1])
+                        if d_match and a_match:
+                            records.append({
+                                "Date": clean_row[0],
+                                "Description": " ".join(clean_row[1:-1]),
+                                "Amount": float(a_match.group(1).replace(",", ""))
+                            })
+                            table_found = True
+
+            if not table_found:
+                text_content = page.extract_text()
+                if text_content:
+                    for line in text_content.split("\n"):
+                        line = line.strip()
+                        if date_regex.match(line):
+                            amt_match = amount_regex.search(line)
+                            if amt_match:
+                                amt_val = float(amt_match.group(1).replace(",", ""))
+                                tokens = line[:amt_match.start()].strip().split()
+                                if len(tokens) >= 2:
+                                    date_part = " ".join(tokens[:2]) if tokens[1].isdigit() else tokens[0]
+                                    desc_part = " ".join(tokens[2:]) if tokens[1].isdigit() else " ".join(tokens[1:])
+                                    records.append({
+                                        "Date": date_part,
+                                        "Description": desc_part if desc_part else "Transaction",
+                                        "Amount": amt_val
+                                    })
+    return pd.DataFrame(records)
+
 # --- Tab 1: Upload Statements ---
 with tab_upload:
     st.subheader("Upload Bank or Credit Card Statement")
-    uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
+    uploaded_file = st.file_uploader("Upload PDF, CSV, or Excel file", type=["pdf", "csv", "xlsx", "xls"])
     account_type = st.selectbox("Account Type", ["Credit Card", "Bank Account"])
 
     if uploaded_file and st.button("Process & Import"):
-        if uploaded_file.name.endswith(".csv"):
+        if uploaded_file.name.lower().endswith(".pdf"):
+            df = parse_pdf_statement(uploaded_file)
+        elif uploaded_file.name.lower().endswith(".csv"):
             df = pd.read_csv(uploaded_file)
         else:
             df = pd.read_excel(uploaded_file)
-        
-        # Standardize column headers
-        cols = {str(c).strip().lower(): c for c in df.columns}
-        date_col = next((cols[k] for k in ["date", "transaction date", "posting date"] if k in cols), None)
-        desc_col = next((cols[k] for k in ["description", "product", "merchant", "memo"] if k in cols), None)
-        amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit"] if k in cols), None)
 
-        if not (date_col and desc_col and amt_col):
-            st.error(f"Could not detect columns. Found: {list(df.columns)}")
+        if df.empty:
+            st.error("No valid transactions could be extracted from this file.")
         else:
-            with engine.connect() as conn:
-                rules = dict(conn.execute(text("SELECT keyword, category FROM categories")).fetchall())
-                imported_count = 0
-                
-                for _, row in df.iterrows():
-                    desc = str(row[desc_col]).strip()
-                    try:
-                        amt = abs(float(row[amt_col]))
-                        if pd.isna(amt) or amt == 0:
+            cols = {str(c).strip().lower(): c for c in df.columns}
+            date_col = next((cols[k] for k in ["date", "transaction date", "posting date"] if k in cols), None)
+            desc_col = next((cols[k] for k in ["description", "product", "merchant", "memo"] if k in cols), None)
+            amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit"] if k in cols), None)
+
+            if not (date_col and desc_col and amt_col):
+                st.error(f"Could not map columns. Found: {list(df.columns)}")
+            else:
+                with engine.connect() as conn:
+                    rules = dict(conn.execute(text("SELECT keyword, category FROM categories")).fetchall())
+                    imported_count = 0
+                    
+                    for _, row in df.iterrows():
+                        desc = str(row[desc_col]).strip()
+                        try:
+                            amt = abs(float(row[amt_col]))
+                            if pd.isna(amt) or amt == 0:
+                                continue
+                        except (ValueError, TypeError):
                             continue
-                    except (ValueError, TypeError):
-                        continue
+                        
+                        try:
+                            date_str = pd.to_datetime(row[date_col]).strftime("%Y-%m-%d")
+                        except Exception:
+                            date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
+                        
+                        is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "CREDIT CARD BILL"]) else 0
+                        
+                        matched_cat = "Uncategorized"
+                        if not is_payment:
+                            for kw, cat in rules.items():
+                                if kw.upper() in desc.upper():
+                                    matched_cat = cat
+                                    break
+                        else:
+                            matched_cat = "Credit Card Bill"
+                        
+                        conn.execute(text("""
+                            INSERT INTO transactions (date, description, amount, category, account_type, is_payment)
+                            VALUES (:date, :desc, :amt, :cat, :acc, :pay)
+                        """), {
+                            "date": date_str, 
+                            "desc": desc, 
+                            "amt": amt, 
+                            "cat": matched_cat, 
+                            "acc": account_type, 
+                            "pay": is_payment
+                        })
+                        imported_count += 1
                     
-                    date_str = pd.to_datetime(row[date_col]).strftime("%Y-%m-%d")
-                    
-                    # Detect credit card payments made from checking
-                    is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "CREDIT CARD BILL"]) else 0
-                    
-                    # Apply keyword matching rules (Walmart will stay Uncategorized)
-                    matched_cat = "Uncategorized"
-                    if not is_payment:
-                        for kw, cat in rules.items():
-                            if kw.upper() in desc.upper():
-                                matched_cat = cat
-                                break
-                    else:
-                        matched_cat = "Credit Card Bill"
-                    
-                    conn.execute(text("""
-                        INSERT INTO transactions (date, description, amount, category, account_type, is_payment)
-                        VALUES (:date, :desc, :amt, :cat, :acc, :pay)
-                    """), {
-                        "date": date_str, 
-                        "desc": desc, 
-                        "amt": amt, 
-                        "cat": matched_cat, 
-                        "acc": account_type, 
-                        "pay": is_payment
-                    })
-                    imported_count += 1
-                
-                conn.commit()
-            st.success(f"Successfully processed and imported {imported_count} transactions!")
+                    conn.commit()
+                st.success(f"Successfully processed and imported {imported_count} transactions!")
 
 # --- Tab 2: Review Uncategorized ---
 with tab_review:
@@ -90,7 +144,7 @@ with tab_review:
         uncat_tx = pd.read_sql("SELECT id, date, description, amount, account_type FROM transactions WHERE category = 'Uncategorized' ORDER BY date DESC", conn)
 
     if uncat_tx.empty:
-        st.info("No uncategorized transactions! All merchants are assigned.")
+        st.info("No uncategorized transactions pending!")
     else:
         st.write(f"**{len(uncat_tx)}** transactions need categorization:")
         for idx, row in uncat_tx.iterrows():
