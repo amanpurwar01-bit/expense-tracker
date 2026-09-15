@@ -5,20 +5,25 @@ from sqlalchemy import create_engine, text
 import pdfplumber
 
 # Connect to cloud database via Streamlit Secrets
-engine = create_engine(st.secrets["DATABASE_URL"])
+engine = create_engine(
+    st.secrets["DATABASE_URL"],
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": 10}
+)
 
 st.set_page_config(page_title="Expense Tracker", layout="wide")
 st.title("💳 Expense & Credit Card Tracker")
 
 tab_upload, tab_review, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "📝 Review Uncategorized", "📊 Monthly Summary", "⚙️ Category Rules"
+    "📥 Upload Statement", "📝 Review Uncategorized", "📊 Monthly Summary", "⚙️ Manage Categories & Rules"
 ])
 
-CATEGORIES = [
-    "Food", "Va-Al-SM", "Transportation", "Utilities", 
-    "Cell Phone", "Clothes", "Entertainment", "Rent", 
-    "Savings", "Sent to India", "Health", "Misc"
-]
+# Helper function to get active category list from Supabase
+def get_categories(conn):
+    cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories ORDER BY name")).fetchall()]
+    if not cats:
+        cats = ["Food", "Va-Al-SM", "Transportation", "Utilities", "Cell Phone", "Clothes", "Entertainment", "Rent", "Health", "Misc", "Savings", "Sent to India", "Salary", "Bank Acc Charges"]
+    return cats
 
 def parse_pdf_statement(file):
     """Extracts transaction rows from bank and credit card statement PDFs."""
@@ -71,7 +76,7 @@ def parse_pdf_statement(file):
 with tab_upload:
     st.subheader("Upload Bank or Credit Card Statement")
     uploaded_file = st.file_uploader("Upload PDF, CSV, or Excel file", type=["pdf", "csv", "xlsx", "xls"])
-    account_type = st.selectbox("Account Type", ["Credit Card", "Bank Account"])
+    account_type = st.selectbox("Account Type", ["Bank Account", "Credit Card"])
 
     if uploaded_file and st.button("Process & Import"):
         if uploaded_file.name.lower().endswith(".pdf"):
@@ -87,7 +92,7 @@ with tab_upload:
             cols = {str(c).strip().lower(): c for c in df.columns}
             date_col = next((cols[k] for k in ["date", "transaction date", "posting date"] if k in cols), None)
             desc_col = next((cols[k] for k in ["description", "product", "merchant", "memo"] if k in cols), None)
-            amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit"] if k in cols), None)
+            amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit", "deposit"] if k in cols), None)
 
             if not (date_col and desc_col and amt_col):
                 st.error(f"Could not map columns. Found: {list(df.columns)}")
@@ -114,10 +119,17 @@ with tab_upload:
                         
                         matched_cat = "Uncategorized"
                         if not is_payment:
-                            for kw, cat in rules.items():
-                                if kw.upper() in desc.upper():
-                                    matched_cat = cat
-                                    break
+                            if any(k in desc.upper() for k in ["HCL CANADA", "PAYROLL", "SALARY"]):
+                                matched_cat = "Salary"
+                            elif any(k in desc.upper() for k in ["ACCOUNT FEE", "BAL REBATE", "MONTHLY FEE"]):
+                                matched_cat = "Bank Acc Charges"
+                            elif any(k in desc.upper() for k in ["GST", "CANADA PRO", "TAX REFUND", "RIT"]):
+                                matched_cat = "ITR Return"
+                            else:
+                                for kw, cat in rules.items():
+                                    if kw.upper() in desc.upper():
+                                        matched_cat = cat
+                                        break
                         else:
                             matched_cat = "Credit Card Bill"
                         
@@ -142,6 +154,21 @@ with tab_review:
     st.subheader("Review & Assign Categories")
     with engine.connect() as conn:
         uncat_tx = pd.read_sql("SELECT id, date, description, amount, account_type FROM transactions WHERE category = 'Uncategorized' ORDER BY date DESC", conn)
+        active_categories = get_categories(conn)
+
+    # Option to quickly create a category on the fly
+    with st.expander("➕ Add a New Category on the fly"):
+        new_quick_cat = st.text_input("New Category Name")
+        is_inc = st.checkbox("Is this an Income category?", value=False)
+        if st.button("Add Category"):
+            if new_quick_cat.strip():
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO custom_categories (name, is_income) VALUES (:name, :inc) ON CONFLICT (name) DO NOTHING"), {
+                        "name": new_quick_cat.strip(), "inc": 1 if is_inc else 0
+                    })
+                    conn.commit()
+                st.success(f"Category '{new_quick_cat.strip()}' added!")
+                st.rerun()
 
     if uncat_tx.empty:
         st.info("No uncategorized transactions pending!")
@@ -151,7 +178,7 @@ with tab_review:
             c1, c2, c3, c4 = st.columns([3, 1, 2, 1.5])
             c1.write(f"**{row['description']}** ({row['date']})")
             c2.write(f"${row['amount']:.2f}")
-            new_cat = c3.selectbox("Category", CATEGORIES, key=f"cat_{row['id']}")
+            new_cat = c3.selectbox("Category", active_categories, key=f"cat_{row['id']}")
             
             with c4:
                 save_rule = st.checkbox("Remember vendor", key=f"rule_{row['id']}", value=False)
@@ -172,11 +199,12 @@ with tab_review:
 
 # --- Tab 3: Monthly Summary & Balance ---
 with tab_dashboard:
-    st.subheader("📊 Expense & Cash Flow Overview")
+    st.subheader("📊 Financial Summary & Cash Flow")
     with engine.connect() as conn:
         cc_charges = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card'")).scalar()
         cc_payments = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE is_payment = 1")).scalar()
-        df_tx = pd.read_sql("SELECT date, amount, category FROM transactions WHERE category NOT IN ('Credit Card Bill', 'Transfer') AND is_payment = 0", conn)
+        df_tx = pd.read_sql("SELECT date, amount, category, is_payment FROM transactions", conn)
+        income_cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories WHERE is_income = 1")).fetchall()]
 
     unpaid_balance = float(cc_charges - cc_payments)
     
@@ -186,16 +214,68 @@ with tab_dashboard:
     col3.metric("Unpaid Credit Card Balance", f"${unpaid_balance:,.2f}", delta=-unpaid_balance, delta_color="inverse")
 
     st.markdown("---")
-    st.write("### Spending by Category and Month")
+    
     if not df_tx.empty:
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Month'] = df_tx['date'].dt.strftime("%b'%y")
-        pivot = df_tx.pivot_table(index='category', columns='Month', values='amount', aggfunc='sum', fill_value=0)
-        st.dataframe(pivot.style.format("${:,.2f}"), use_container_width=True)
+        
+        # 1. Income Table
+        df_income = df_tx[df_tx['category'].isin(income_cats)]
+        if not df_income.empty:
+            st.write("### 💵 Income Breakdown")
+            income_pivot = df_income.pivot_table(index='category', columns='Month', values='amount', aggfunc='sum', fill_value=0)
+            st.dataframe(income_pivot.style.format("${:,.2f}"), use_container_width=True)
+            
+        # 2. Living Expenses & Savings Table
+        excluded_cats = income_cats + ["Credit Card Bill", "Transfer", "Bank Acc Charges"]
+        df_exp = df_tx[~df_tx['category'].isin(excluded_cats) & (df_tx['is_payment'] == 0)]
+        if not df_exp.empty:
+            st.write("### 🛒 Expenses & Savings Breakdown")
+            exp_pivot = df_exp.pivot_table(index='category', columns='Month', values='amount', aggfunc='sum', fill_value=0)
+            st.dataframe(exp_pivot.style.format("${:,.2f}"), use_container_width=True)
 
-# --- Tab 4: Category Keyword Rules ---
+# --- Tab 4: Category & Keyword Rules Management ---
 with tab_rules:
-    st.subheader("⚙️ Managed Keyword Rules")
-    with engine.connect() as conn:
-        rules_df = pd.read_sql("SELECT keyword AS Keyword, category AS Category FROM categories ORDER BY Category", conn)
-    st.dataframe(rules_df, use_container_width=True)
+    st.subheader("⚙️ Manage Categories & Keyword Rules")
+    
+    c_left, c_right = st.columns(2)
+    
+    with c_left:
+        st.write("#### 📂 Master Categories")
+        with engine.connect() as conn:
+            all_cats_df = pd.read_sql("SELECT name AS Category, CASE WHEN is_income = 1 THEN 'Income' ELSE 'Expense/Savings' END AS Type FROM custom_categories ORDER BY name", conn)
+        st.dataframe(all_cats_df, use_container_width=True)
+        
+        st.write("##### Add New Category")
+        new_cat_name = st.text_input("Category Name", key="new_cat_input")
+        cat_is_inc = st.checkbox("Is Income?", key="new_cat_is_inc")
+        if st.button("Add to Master List"):
+            if new_cat_name.strip():
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO custom_categories (name, is_income) VALUES (:name, :inc) ON CONFLICT (name) DO NOTHING"), {
+                        "name": new_cat_name.strip(), "inc": 1 if cat_is_inc else 0
+                    })
+                    conn.commit()
+                st.success(f"Category '{new_cat_name.strip()}' created!")
+                st.rerun()
+
+    with c_right:
+        st.write("#### 🔍 Keyword Auto-Rules")
+        with engine.connect() as conn:
+            rules_df = pd.read_sql("SELECT keyword AS Keyword, category AS Category FROM categories ORDER BY Category", conn)
+        st.dataframe(rules_df, use_container_width=True)
+        
+        st.write("##### Add Custom Auto-Rule")
+        kw_input = st.text_input("Vendor Keyword (e.g. GYM)")
+        with engine.connect() as conn:
+            rule_cats = get_categories(conn)
+        kw_cat = st.selectbox("Assign to Category", rule_cats, key="kw_cat_select")
+        if st.button("Save Auto-Rule"):
+            if kw_input.strip():
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO categories (keyword, category) VALUES (:kw, :cat) ON CONFLICT (keyword) DO UPDATE SET category = :cat"), {
+                        "kw": kw_input.strip().upper(), "cat": kw_cat
+                    })
+                    conn.commit()
+                st.success(f"Rule added: '{kw_input.strip().upper()}' ➔ '{kw_cat}'")
+                st.rerun()
