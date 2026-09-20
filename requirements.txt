@@ -1,6 +1,8 @@
 streamlit
 pandas
+sqlalchemy
 psycopg2-binary
 openpyxl
-sqlalchemy
+pypdf
+pdfminer.six
 pdfplumber
