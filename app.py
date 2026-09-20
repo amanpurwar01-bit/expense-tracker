@@ -38,8 +38,15 @@ with engine.connect() as conn:
         ALTER TABLE custom_categories ADD COLUMN IF NOT EXISTS cat_type TEXT DEFAULT 'Expense';
     """))
 
-    # Purge deprecated categories from selection lists
-    conn.execute(text("DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment')"))
+    # [STEP 1 FIX] Clean up legacy payment entries in database
+    conn.execute(text("""
+        UPDATE transactions 
+        SET category = 'Card Payment', is_payment = 1 
+        WHERE category IN ('Credit Card Bill', 'Credit Card Payment')
+           OR description ILIKE '%TD VISA%'
+           OR description ILIKE '%PAYMENT%THANK YOU%';
+        DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment');
+    """))
 
     # Seed master categories with defined structural types
     seed_categories = [
@@ -437,7 +444,7 @@ with tab_dashboard:
     if df_tx.empty:
         st.info("No transactions found in database. Please upload bank or credit card statements.")
     else:
-        # Cast all numeric data to standard native floats
+        # Cast all numeric amounts to standard floats
         df_tx['amount'] = pd.to_numeric(df_tx['amount'], errors='coerce').fillna(0.0).astype(float)
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Year'] = df_tx['date'].dt.year
@@ -460,10 +467,17 @@ with tab_dashboard:
 
         df_filtered = df_tx[(df_tx['Year'].isin(selected_years)) & (df_tx['Month_Str'].isin(selected_months))]
 
-        # Strict Living Expenses (Excludes ATM cash withdrawal wash, Card Payments, and Internal Transfers)
+        # [STEP 2 FIX] Explicit exclusion of all non-living, wash, and debt payments from Living Expenses
+        excluded_from_living = [
+            'Card Payment', 'Credit Card Bill', 'Credit Card Payment', 
+            'Internal Transfer', 'Cash', 'Bank Acc Charges', 'Shared Reimbursement'
+        ]
+        
         df_living = df_filtered[
             (df_filtered['cat_type'] == 'Expense') & 
             (df_filtered['is_payment'] == 0) &
+            (~df_filtered['category'].isin(excluded_from_living)) &
+            (~df_filtered['description'].str.contains(r'TD VISA|PAYMENT.*THANK YOU', case=False, na=False)) &
             ~((df_filtered['account_type'] == 'Bank Account') & (df_filtered['category'] == 'Cash'))
         ]
         
