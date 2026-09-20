@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import io
 from sqlalchemy import create_engine, text
 import pdfplumber
 
@@ -72,6 +73,27 @@ def parse_pdf_statement(file):
                                         "Amount": amt_val
                                     })
     return pd.DataFrame(records)
+
+def generate_excel_download(df_raw, cat_pivot=None, inc_pivot=None):
+    """Generates a multi-sheet Excel file in memory."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_export = df_raw.copy()
+        if 'date' in df_export.columns:
+            df_export['date'] = pd.to_datetime(df_export['date']).dt.strftime('%Y-%m-%d')
+        
+        cols_to_export = [c for c in ['date', 'description', 'amount', 'category', 'account_type'] if c in df_export.columns]
+        df_export[cols_to_export].rename(columns={
+            'date': 'Date', 'description': 'Description', 'amount': 'Amount', 
+            'category': 'Category', 'account_type': 'Account'
+        }).to_excel(writer, sheet_name='Transactions', index=False)
+        
+        if cat_pivot is not None and not cat_pivot.empty:
+            cat_pivot.to_excel(writer, sheet_name='Spending Summary')
+        if inc_pivot is not None and not inc_pivot.empty:
+            inc_pivot.to_excel(writer, sheet_name='Income Summary')
+            
+    return output.getvalue()
 
 # --- Tab 1: Upload Statements ---
 with tab_upload:
@@ -208,24 +230,19 @@ with tab_dashboard:
     if df_tx.empty:
         st.info("No transactions found in the database. Upload statements to view insights!")
     else:
-        # Pre-process dates
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Year'] = df_tx['date'].dt.year
         df_tx['Month_Period'] = df_tx['date'].dt.to_period('M')
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
 
-        # Exclude internal non-spending transactions from default expense calculations
-        excluded_defaults = ["Credit Card Bill", "Transfer", "Bank Acc Charges"] + income_cats
-
-        # --- Interactive Filter Bar ---
-        st.markdown("### 🔍 Filters & Settings")
-        f_col1, f_col2 = st.columns(2)
+        # --- Top Filter & Action Bar ---
+        st.markdown("### 🔍 Filters & Data Export")
+        f_col1, f_col2, f_col3 = st.columns([1.5, 1.5, 1.5])
         
         all_years = sorted(df_tx['Year'].unique(), reverse=True)
         with f_col1:
             selected_years = st.multiselect("Select Year(s)", options=all_years, default=all_years)
         
-        # Filter months by selected years
         available_months = (
             df_tx[df_tx['Year'].isin(selected_years)]
             .sort_values('date')[['Month_Period', 'Month_Str']]
@@ -235,16 +252,15 @@ with tab_dashboard:
         with f_col2:
             selected_months = st.multiselect("Select Month(s)", options=month_options, default=month_options)
 
-        # Category inclusion/exclusion filter
         available_categories = sorted([c for c in df_tx['category'].unique() if c not in ["Credit Card Bill", "Transfer", "Bank Acc Charges"] and c not in income_cats])
         selected_categories = st.multiselect(
             "Include / Remove Spending Categories from Dashboard",
             options=available_categories,
             default=available_categories,
-            help="Uncheck any category (e.g. Sent to India, Rent) to see your variable living expenses without them."
+            help="Uncheck any category to see expenses without them."
         )
 
-        # Apply active filters
+        # Apply filters
         df_filtered = df_tx[
             (df_tx['Year'].isin(selected_years)) &
             (df_tx['Month_Str'].isin(selected_months))
@@ -256,6 +272,39 @@ with tab_dashboard:
         ]
         
         df_income_filtered = df_filtered[df_filtered['category'].isin(income_cats)]
+
+        # Pre-compute pivot tables for view & export
+        cat_pivot = None
+        if not df_spending_filtered.empty:
+            cat_pivot = df_spending_filtered.pivot_table(
+                index='category', columns='Month_Str', values='amount', aggfunc='sum', fill_value=0
+            )
+            ordered_cols = [m for m in month_options if m in cat_pivot.columns]
+            cat_pivot = cat_pivot[ordered_cols]
+            cat_pivot['Total'] = cat_pivot.sum(axis=1)
+            cat_pivot = cat_pivot.sort_values('Total', ascending=False)
+
+        inc_pivot = None
+        if not df_income_filtered.empty:
+            inc_pivot = df_income_filtered.pivot_table(
+                index='category', columns='Month_Str', values='amount', aggfunc='sum', fill_value=0
+            )
+            inc_ordered = [m for m in month_options if m in inc_pivot.columns]
+            inc_pivot = inc_pivot[inc_ordered]
+            inc_pivot['Total'] = inc_pivot.sum(axis=1)
+
+        # Export Button in Top Bar
+        with f_col3:
+            st.write(" ")
+            st.write(" ")
+            excel_bytes = generate_excel_download(df_filtered, cat_pivot, inc_pivot)
+            st.download_button(
+                label="📥 Download Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=f"Expense_Report_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
         # --- Summary Metric Cards ---
         st.markdown("---")
@@ -276,7 +325,6 @@ with tab_dashboard:
         st.subheader("📈 Month-on-Month Trends")
         
         if not df_spending_filtered.empty:
-            # Aggregate by month chronologically
             monthly_agg = (
                 df_spending_filtered.groupby(['Month_Period', 'Month_Str'])['amount']
                 .sum()
@@ -286,20 +334,7 @@ with tab_dashboard:
             chart_data = monthly_agg.set_index('Month_Str')[['amount']].rename(columns={'amount': 'Total Spending ($)'})
             st.bar_chart(chart_data)
 
-            # Month-by-Month Category Pivot Table
             st.write("#### 📊 Category Breakdown Table")
-            cat_pivot = df_spending_filtered.pivot_table(
-                index='category', 
-                columns='Month_Str', 
-                values='amount', 
-                aggfunc='sum', 
-                fill_value=0
-            )
-            # Reorder columns chronologically
-            ordered_cols = [m for m in month_options if m in cat_pivot.columns]
-            cat_pivot = cat_pivot[ordered_cols]
-            cat_pivot['Total'] = cat_pivot.sum(axis=1)
-            cat_pivot = cat_pivot.sort_values('Total', ascending=False)
             st.dataframe(cat_pivot.style.format("${:,.2f}"), use_container_width=True)
 
         # --- Single Category Inspector ---
@@ -311,7 +346,6 @@ with tab_dashboard:
             cat_tx = df_filtered[df_filtered['category'] == inspect_cat].sort_values('date', ascending=False)
             st.write(f"Showing **{len(cat_tx)}** transactions for **{inspect_cat}** totaling **${cat_tx['amount'].sum():,.2f}**:")
             
-            # Show category MoM trend chart
             cat_mom = cat_tx.groupby(['Month_Period', 'Month_Str'])['amount'].sum().reset_index().sort_values('Month_Period')
             if len(cat_mom) > 1:
                 st.line_chart(cat_mom.set_index('Month_Str')['amount'])
@@ -324,19 +358,9 @@ with tab_dashboard:
             )
 
         # --- Income Breakdown Table ---
-        if not df_income_filtered.empty:
+        if inc_pivot is not None and not inc_pivot.empty:
             st.markdown("---")
             st.subheader("💵 Income Stream Summary")
-            inc_pivot = df_income_filtered.pivot_table(
-                index='category', 
-                columns='Month_Str', 
-                values='amount', 
-                aggfunc='sum', 
-                fill_value=0
-            )
-            inc_ordered = [m for m in month_options if m in inc_pivot.columns]
-            inc_pivot = inc_pivot[inc_ordered]
-            inc_pivot['Total'] = inc_pivot.sum(axis=1)
             st.dataframe(inc_pivot.style.format("${:,.2f}"), use_container_width=True)
 
 # --- Tab 4: Category & Keyword Rules Management ---
