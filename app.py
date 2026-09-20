@@ -38,10 +38,10 @@ with engine.connect() as conn:
         ALTER TABLE custom_categories ADD COLUMN IF NOT EXISTS cat_type TEXT DEFAULT 'Expense';
     """))
 
-    # Remove deprecated categories from category pickers
+    # Purge deprecated categories from selection lists
     conn.execute(text("DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment')"))
 
-    # Seed core structural categories
+    # Seed master categories with defined structural types
     seed_categories = [
         # Living Expenses
         ('Food', 'Expense'), ('Va-Al-SM', 'Expense'), ('Transportation', 'Expense'),
@@ -66,7 +66,7 @@ with engine.connect() as conn:
         """), {"name": cat_name, "type": ctype})
     conn.commit()
 
-# Primary Tabs
+# Primary Navigation Tabs
 tab_upload, tab_split, tab_cash, tab_dashboard, tab_rules = st.tabs([
     "📥 Upload & Coverage", "✂️ Review & Split Expenses", "💵 Cash Wallet", "📊 Financial Dashboard", "⚙️ Category & Auto-Rules"
 ])
@@ -200,13 +200,11 @@ with tab_upload:
 
                             # Directional sign handling
                             if account_type == "Credit Card":
-                                # Refund on card: negative amount that is not a payment credit
                                 if raw_amt < 0 and not is_payment:
                                     final_amt = raw_amt
                                 else:
                                     final_amt = abs(raw_amt)
                             else:
-                                # Bank: Fee rebate is negative to cleanly wash the account fee
                                 if is_fee_rebate:
                                     final_amt = -abs(raw_amt)
                                 else:
@@ -315,7 +313,7 @@ with tab_split:
         st.write(f"**{len(uncat_tx)}** transactions require category assignment:")
         
         for _, row in uncat_tx.iterrows():
-            with st.expander(f"📌 {row['date']} | {row['description']} | ${row['amount']:.2f} ({row['account_type']})", expanded=True):
+            with st.expander(f"📌 {row['date']} | {row['description']} | ${float(row['amount']):.2f} ({row['account_type']})", expanded=True):
                 col_std, col_split = st.columns([1.2, 1.2])
                 
                 with col_std:
@@ -333,8 +331,9 @@ with tab_split:
 
                 with col_split:
                     st.write("**✂️ Split Group / Shared Bill**")
-                    my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=float(abs(row['amount'])), value=float(abs(row['amount']))/2, step=1.0, key=f"split_my_{row['id']}")
-                    friends_share = round(float(abs(row['amount'])) - my_share, 2)
+                    amt_val = float(abs(row['amount']))
+                    my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=amt_val, value=amt_val/2, step=1.0, key=f"split_my_{row['id']}")
+                    friends_share = round(amt_val - my_share, 2)
                     st.caption(f"Reimbursable by Friends: **${friends_share:.2f}** (Auto-assigned to `Shared Reimbursement`)")
                     my_category = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map[c] == 'Expense'], key=f"split_cat_{row['id']}")
                     
@@ -370,17 +369,20 @@ with tab_cash:
     st.subheader("💵 Physical Cash Wallet & Reconciliation")
     
     with engine.connect() as conn:
-        cash_withdrawn = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Bank Account' AND (category = 'Cash' OR description ILIKE '%ATM%')")).scalar()
-        cash_spent = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Cash'")).scalar()
+        cash_withdrawn = float(conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Bank Account' AND (category = 'Cash' OR description ILIKE '%ATM%')")).scalar() or 0.0)
+        cash_spent = float(conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Cash'")).scalar() or 0.0)
         df_cash_tx = pd.read_sql("SELECT id, date, description, amount, category FROM transactions WHERE account_type = 'Cash' ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
         spending_cats = [c for c in cat_map.keys() if cat_map[c] == 'Expense']
 
-    cash_in_hand = float(cash_withdrawn - cash_spent)
+    if not df_cash_tx.empty:
+        df_cash_tx['amount'] = pd.to_numeric(df_cash_tx['amount'], errors='coerce').fillna(0.0).astype(float)
+
+    cash_in_hand = cash_withdrawn - cash_spent
     
     cw1, cw2, cw3 = st.columns(3)
-    cw1.metric("Total ATM Cash Withdrawn", f"${float(cash_withdrawn):,.2f}")
-    cw2.metric("Total Cash Spent Logged", f"${float(cash_spent):,.2f}")
+    cw1.metric("Total ATM Cash Withdrawn", f"${cash_withdrawn:,.2f}")
+    cw2.metric("Total Cash Spent Logged", f"${cash_spent:,.2f}")
     cw3.metric("Current Cash in Hand", f"${cash_in_hand:,.2f}", delta=cash_in_hand)
 
     st.markdown("---")
@@ -413,7 +415,7 @@ with tab_cash:
                 h1, h2, h3, h4 = st.columns([2, 1.2, 1, 0.8])
                 h1.write(f"**{r['description']}** ({r['date']})")
                 h2.write(f"`{r['category']}`")
-                h3.write(f"${r['amount']:.2f}")
+                h3.write(f"${float(r['amount']):.2f}")
                 if h4.button("Delete", key=f"del_c_{r['id']}"):
                     with engine.connect() as conn:
                         conn.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": r['id']})
@@ -426,22 +428,24 @@ with tab_cash:
 with tab_dashboard:
     with engine.connect() as conn:
         df_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions", conn)
-        cc_charges = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 0")).scalar()
-        cc_payments_bank = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Bank Account' AND is_payment = 1")).scalar()
-        cc_payments_card = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 1")).scalar()
-        cc_payments = max(float(cc_payments_bank), float(cc_payments_card))
+        cc_charges = float(conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 0")).scalar() or 0.0)
+        cc_payments_bank = float(conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Bank Account' AND is_payment = 1")).scalar() or 0.0)
+        cc_payments_card = float(conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 1")).scalar() or 0.0)
+        cc_payments = max(cc_payments_bank, cc_payments_card)
         cat_map = get_categories_dict(conn)
 
     if df_tx.empty:
         st.info("No transactions found in database. Please upload bank or credit card statements.")
     else:
+        # Cast all numeric data to standard native floats
+        df_tx['amount'] = pd.to_numeric(df_tx['amount'], errors='coerce').fillna(0.0).astype(float)
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Year'] = df_tx['date'].dt.year
         df_tx['Month_Period'] = df_tx['date'].dt.to_period('M')
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
         df_tx['cat_type'] = df_tx['category'].map(cat_map).fillna('Expense')
 
-        # Filter Bar
+        # Filter Controls
         st.markdown("### 🔍 Dashboard Filters & Data Export")
         f1, f2, f3 = st.columns([1.5, 1.5, 1.5])
         
@@ -492,10 +496,10 @@ with tab_dashboard:
         # Executive Metrics
         st.markdown("---")
         m1, m2, m3, m4 = st.columns(4)
-        tot_living = df_living['amount'].sum()
-        tot_income = df_income['amount'].sum()
+        tot_living = float(df_living['amount'].sum())
+        tot_income = float(df_income['amount'].sum())
         net_saved = tot_income - tot_living
-        unpaid_cc = float(cc_charges - cc_payments)
+        unpaid_cc = cc_charges - cc_payments
 
         m1.metric("Core Living Expenses", f"${tot_living:,.2f}")
         m2.metric("Total Inflow / Income", f"${tot_income:,.2f}")
@@ -507,15 +511,15 @@ with tab_dashboard:
         st.write("#### 🛡️ Wealth Accumulation & Remittances")
         w1, w2, w3, w4 = st.columns(4)
         
-        tfsa_tot = df_tx[df_tx['category'] == 'TFSA']['amount'].sum()
-        fhsa_tot = df_tx[df_tx['category'] == 'FHSA']['amount'].sum()
-        ria_tot = df_tx[df_tx['category'] == 'Sent to India']['amount'].sum()
-        shared_owed = df_tx[df_tx['category'] == 'Shared Reimbursement']['amount'].sum()
+        tfsa_tot = float(df_tx[df_tx['category'] == 'TFSA']['amount'].sum())
+        fhsa_tot = float(df_tx[df_tx['category'] == 'FHSA']['amount'].sum())
+        ria_tot = float(df_tx[df_tx['category'] == 'Sent to India']['amount'].sum())
+        shared_owed = float(df_tx[df_tx['category'] == 'Shared Reimbursement']['amount'].sum())
 
         w1.metric("TFSA Contributions", f"${tfsa_tot:,.2f}")
         w2.metric("FHSA Contributions (Cap: $8,000)", f"${fhsa_tot:,.2f}")
         w3.metric("Sent to India (Ria)", f"${ria_tot:,.2f}")
-        w4.metric("Friend Reimbursements Due", f"${shared_owed:,.2f}", delta=-shared_owed if shared_owed > 0 else 0, delta_color="inverse")
+        w4.metric("Friend Reimbursements Due", f"${shared_owed:,.2f}", delta=-shared_owed if shared_owed > 0 else 0.0, delta_color="inverse")
         
         fhsa_cap = 8000.0
         st.caption(f"FHSA Annual Room Used: ${fhsa_tot:,.2f} /${fhsa_cap:,.2f} ({min(fhsa_tot/fhsa_cap, 1.0)*100:.1f}%)")
@@ -542,17 +546,17 @@ with tab_dashboard:
             df_cat = df_living[df_living['category'] == inspect_cat]
             cat_mom = df_cat.groupby(['Month_Period', 'Month_Str'])['amount'].sum().reset_index().sort_values('Month_Period')
             
-            # Align with complete chronological months
+            # Align across chronological months
             cat_mom_full = pd.DataFrame({'Month_Str': month_order})
-            cat_mom_full = cat_mom_full.merge(cat_mom[['Month_Str', 'amount']], on='Month_Str', how='left').fillna(0)
+            cat_mom_full = cat_mom_full.merge(cat_mom[['Month_Str', 'amount']], on='Month_Str', how='left').fillna(0.0)
             
-            total_cat_spend = df_cat['amount'].sum()
+            total_cat_spend = float(df_cat['amount'].sum())
             avg_cat_spend = total_cat_spend / max(len(month_order), 1)
             
             # Compute latest MoM Delta
             if len(cat_mom_full) >= 2:
-                latest_amt = cat_mom_full.iloc[-1]['amount']
-                prev_amt = cat_mom_full.iloc[-2]['amount']
+                latest_amt = float(cat_mom_full.iloc[-1]['amount'])
+                prev_amt = float(cat_mom_full.iloc[-2]['amount'])
                 delta_val = latest_amt - prev_amt
                 delta_str = f"${delta_val:+,.2f} vs {cat_mom_full.iloc[-2]['Month_Str']}"
             else:
