@@ -15,14 +15,15 @@ st.set_page_config(page_title="Expense Tracker", layout="wide")
 st.title("💳 Expense & Credit Card Tracker")
 
 tab_upload, tab_review, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "📝 Review Uncategorized", "📊 Monthly Summary", "⚙️ Manage Categories & Rules"
+    "📥 Upload Statement", "📝 Review Uncategorized", "📊 Interactive Dashboard", "⚙️ Manage Categories & Rules"
 ])
 
-# Helper function to get active category list from Supabase
 def get_categories(conn):
+    """Fetch active custom categories from Supabase."""
     cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories ORDER BY name")).fetchall()]
     if not cats:
-        cats = ["Food", "Va-Al-SM", "Transportation", "Utilities", "Cell Phone", "Clothes", "Entertainment", "Rent", "Health", "Misc", "Savings", "Sent to India", "Salary", "Bank Acc Charges"]
+        cats = ["Food", "Va-Al-SM", "Transportation", "Utilities", "Cell Phone", "Clothes", 
+                "Entertainment", "Rent", "Health", "Misc", "Savings", "Sent to India", "Salary", "Bank Acc Charges"]
     return cats
 
 def parse_pdf_statement(file):
@@ -115,7 +116,7 @@ with tab_upload:
                         except Exception:
                             date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
                         
-                        is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "CREDIT CARD BILL"]) else 0
+                        is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "CREDIT CARD BILL", "PAYMENT-THANK YOU"]) else 0
                         
                         matched_cat = "Uncategorized"
                         if not is_payment:
@@ -156,7 +157,6 @@ with tab_review:
         uncat_tx = pd.read_sql("SELECT id, date, description, amount, account_type FROM transactions WHERE category = 'Uncategorized' ORDER BY date DESC", conn)
         active_categories = get_categories(conn)
 
-    # Option to quickly create a category on the fly
     with st.expander("➕ Add a New Category on the fly"):
         new_quick_cat = st.text_input("New Category Name")
         is_inc = st.checkbox("Is this an Income category?", value=False)
@@ -197,42 +197,147 @@ with tab_review:
                         conn.commit()
                     st.rerun()
 
-# --- Tab 3: Monthly Summary & Balance ---
+# --- Tab 3: Interactive Dashboard ---
 with tab_dashboard:
-    st.subheader("📊 Financial Summary & Cash Flow")
     with engine.connect() as conn:
+        df_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions", conn)
         cc_charges = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card'")).scalar()
         cc_payments = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE is_payment = 1")).scalar()
-        df_tx = pd.read_sql("SELECT date, amount, category, is_payment FROM transactions", conn)
         income_cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories WHERE is_income = 1")).fetchall()]
 
-    unpaid_balance = float(cc_charges - cc_payments)
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Card Charges Tracked", f"${float(cc_charges):,.2f}")
-    col2.metric("Total Payments Sent to Card", f"${float(cc_payments):,.2f}")
-    col3.metric("Unpaid Credit Card Balance", f"${unpaid_balance:,.2f}", delta=-unpaid_balance, delta_color="inverse")
-
-    st.markdown("---")
-    
-    if not df_tx.empty:
+    if df_tx.empty:
+        st.info("No transactions found in the database. Upload statements to view insights!")
+    else:
+        # Pre-process dates
         df_tx['date'] = pd.to_datetime(df_tx['date'])
-        df_tx['Month'] = df_tx['date'].dt.strftime("%b'%y")
+        df_tx['Year'] = df_tx['date'].dt.year
+        df_tx['Month_Period'] = df_tx['date'].dt.to_period('M')
+        df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
+
+        # Exclude internal non-spending transactions from default expense calculations
+        excluded_defaults = ["Credit Card Bill", "Transfer", "Bank Acc Charges"] + income_cats
+
+        # --- Interactive Filter Bar ---
+        st.markdown("### 🔍 Filters & Settings")
+        f_col1, f_col2 = st.columns(2)
         
-        # 1. Income Table
-        df_income = df_tx[df_tx['category'].isin(income_cats)]
-        if not df_income.empty:
-            st.write("### 💵 Income Breakdown")
-            income_pivot = df_income.pivot_table(index='category', columns='Month', values='amount', aggfunc='sum', fill_value=0)
-            st.dataframe(income_pivot.style.format("${:,.2f}"), use_container_width=True)
+        all_years = sorted(df_tx['Year'].unique(), reverse=True)
+        with f_col1:
+            selected_years = st.multiselect("Select Year(s)", options=all_years, default=all_years)
+        
+        # Filter months by selected years
+        available_months = (
+            df_tx[df_tx['Year'].isin(selected_years)]
+            .sort_values('date')[['Month_Period', 'Month_Str']]
+            .drop_duplicates()
+        )
+        month_options = available_months['Month_Str'].tolist()
+        with f_col2:
+            selected_months = st.multiselect("Select Month(s)", options=month_options, default=month_options)
+
+        # Category inclusion/exclusion filter
+        available_categories = sorted([c for c in df_tx['category'].unique() if c not in ["Credit Card Bill", "Transfer", "Bank Acc Charges"] and c not in income_cats])
+        selected_categories = st.multiselect(
+            "Include / Remove Spending Categories from Dashboard",
+            options=available_categories,
+            default=available_categories,
+            help="Uncheck any category (e.g. Sent to India, Rent) to see your variable living expenses without them."
+        )
+
+        # Apply active filters
+        df_filtered = df_tx[
+            (df_tx['Year'].isin(selected_years)) &
+            (df_tx['Month_Str'].isin(selected_months))
+        ]
+        
+        df_spending_filtered = df_filtered[
+            (df_filtered['category'].isin(selected_categories)) & 
+            (df_filtered['is_payment'] == 0)
+        ]
+        
+        df_income_filtered = df_filtered[df_filtered['category'].isin(income_cats)]
+
+        # --- Summary Metric Cards ---
+        st.markdown("---")
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        
+        total_income = df_income_filtered['amount'].sum()
+        total_spending = df_spending_filtered['amount'].sum()
+        net_saved = total_income - total_spending
+        unpaid_cc = float(cc_charges - cc_payments)
+
+        m_col1.metric("Selected Spending", f"${total_spending:,.2f}")
+        m_col2.metric("Selected Income", f"${total_income:,.2f}")
+        m_col3.metric("Net Cash Flow", f"${net_saved:,.2f}", delta=net_saved)
+        m_col4.metric("Unpaid Credit Card Balance", f"${unpaid_cc:,.2f}", delta=-unpaid_cc, delta_color="inverse")
+
+        # --- Month-on-Month Trends & Comparison ---
+        st.markdown("---")
+        st.subheader("📈 Month-on-Month Trends")
+        
+        if not df_spending_filtered.empty:
+            # Aggregate by month chronologically
+            monthly_agg = (
+                df_spending_filtered.groupby(['Month_Period', 'Month_Str'])['amount']
+                .sum()
+                .reset_index()
+                .sort_values('Month_Period')
+            )
+            chart_data = monthly_agg.set_index('Month_Str')[['amount']].rename(columns={'amount': 'Total Spending ($)'})
+            st.bar_chart(chart_data)
+
+            # Month-by-Month Category Pivot Table
+            st.write("#### 📊 Category Breakdown Table")
+            cat_pivot = df_spending_filtered.pivot_table(
+                index='category', 
+                columns='Month_Str', 
+                values='amount', 
+                aggfunc='sum', 
+                fill_value=0
+            )
+            # Reorder columns chronologically
+            ordered_cols = [m for m in month_options if m in cat_pivot.columns]
+            cat_pivot = cat_pivot[ordered_cols]
+            cat_pivot['Total'] = cat_pivot.sum(axis=1)
+            cat_pivot = cat_pivot.sort_values('Total', ascending=False)
+            st.dataframe(cat_pivot.style.format("${:,.2f}"), use_container_width=True)
+
+        # --- Single Category Inspector ---
+        st.markdown("---")
+        st.subheader("🎯 Deep-Dive by Specific Category")
+        
+        inspect_cat = st.selectbox("Choose a category to drill into", options=["All"] + available_categories)
+        if inspect_cat != "All":
+            cat_tx = df_filtered[df_filtered['category'] == inspect_cat].sort_values('date', ascending=False)
+            st.write(f"Showing **{len(cat_tx)}** transactions for **{inspect_cat}** totaling **${cat_tx['amount'].sum():,.2f}**:")
             
-        # 2. Living Expenses & Savings Table
-        excluded_cats = income_cats + ["Credit Card Bill", "Transfer", "Bank Acc Charges"]
-        df_exp = df_tx[~df_tx['category'].isin(excluded_cats) & (df_tx['is_payment'] == 0)]
-        if not df_exp.empty:
-            st.write("### 🛒 Expenses & Savings Breakdown")
-            exp_pivot = df_exp.pivot_table(index='category', columns='Month', values='amount', aggfunc='sum', fill_value=0)
-            st.dataframe(exp_pivot.style.format("${:,.2f}"), use_container_width=True)
+            # Show category MoM trend chart
+            cat_mom = cat_tx.groupby(['Month_Period', 'Month_Str'])['amount'].sum().reset_index().sort_values('Month_Period')
+            if len(cat_mom) > 1:
+                st.line_chart(cat_mom.set_index('Month_Str')['amount'])
+                
+            st.dataframe(
+                cat_tx[['date', 'description', 'amount', 'account_type']]
+                .rename(columns={'date': 'Date', 'description': 'Description', 'amount': 'Amount ($)', 'account_type': 'Account'})
+                .assign(Date=lambda x: x['Date'].dt.strftime("%Y-%m-%d")),
+                use_container_width=True
+            )
+
+        # --- Income Breakdown Table ---
+        if not df_income_filtered.empty:
+            st.markdown("---")
+            st.subheader("💵 Income Stream Summary")
+            inc_pivot = df_income_filtered.pivot_table(
+                index='category', 
+                columns='Month_Str', 
+                values='amount', 
+                aggfunc='sum', 
+                fill_value=0
+            )
+            inc_ordered = [m for m in month_options if m in inc_pivot.columns]
+            inc_pivot = inc_pivot[inc_ordered]
+            inc_pivot['Total'] = inc_pivot.sum(axis=1)
+            st.dataframe(inc_pivot.style.format("${:,.2f}"), use_container_width=True)
 
 # --- Tab 4: Category & Keyword Rules Management ---
 with tab_rules:
