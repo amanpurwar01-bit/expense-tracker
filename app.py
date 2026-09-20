@@ -6,7 +6,6 @@ from datetime import datetime
 from collections import defaultdict
 from sqlalchemy import create_engine, text
 import pypdf
-from pdfminer.high_level import extract_text as pdfminer_extract_text
 from pdfminer.layout import LAParams, LTTextBox
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
@@ -22,7 +21,7 @@ engine = create_engine(
 st.set_page_config(page_title="Personal Finance Hub", layout="wide", page_icon="💳")
 st.title("💳 Personal Finance & 2026 Reconciliation Hub")
 
-# Clean legacy payment entries on startup
+# Auto-cleanup database on startup
 with engine.connect() as conn:
     conn.execute(text("""
         UPDATE transactions 
@@ -30,27 +29,33 @@ with engine.connect() as conn:
         WHERE category IN ('Credit Card Bill', 'Credit Card Payment')
            OR description ILIKE '%TD VISA%'
            OR description ILIKE '%PAYMENT%THANK YOU%';
+
+        -- Auto-fix any Ria transfers that were misfiled due to spaces
+        UPDATE transactions
+        SET category = 'Ria'
+        WHERE category = 'Uncategorized'
+          AND (description ILIKE '%R ia%' OR description ILIKE '%Ria%');
+
         DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment');
     """))
     conn.commit()
 
-tab_upload, tab_split, tab_cash, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "✂️ Review & Split Bills", "💵 Cash Wallet", "📊 2026 Budget Dashboard", "⚙️ Rules & Categories"
+tab_upload, tab_manage, tab_cash, tab_dashboard, tab_rules = st.tabs([
+    "📥 Upload Statement", "✏️ Edit & Split Transactions", "💵 Cash Wallet", "📊 2026 Budget Dashboard", "⚙️ Rules & Categories"
 ])
 
 def get_categories_dict(conn):
     rows = conn.execute(text("SELECT name, cat_type FROM custom_categories ORDER BY name")).fetchall()
     return {r[0]: r[1] for r in rows}
 
-# ==========================================================
-# --- NATIVE TD STATEMENT PDF PARSING ENGINE ---
-# ==========================================================
-
 MONTH_MAP = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
              'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
 
+# ==========================================================
+# --- TD STATEMENT PDF PARSERS ---
+# ==========================================================
+
 def parse_td_chequing_pdf(file_bytes, year=2026):
-    """Accurately extracts all transactions from a TD Chequing PDF statement."""
     rsrcmgr = PDFResourceManager()
     laparams = LAParams(line_margin=0.1)
     device = PDFPageAggregator(rsrcmgr, laparams=laparams)
@@ -120,7 +125,6 @@ def parse_td_chequing_pdf(file_bytes, year=2026):
     return pd.DataFrame(txns)
 
 def parse_td_visa_pdf(file_bytes, year=2026):
-    """Accurately extracts all transactions from a TD Visa Credit Card PDF statement."""
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
     date_re = re.compile(
         r'^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\s+(-?\$?[\d,]+\.\d{2})(.*)$',
@@ -144,7 +148,7 @@ def parse_td_visa_pdf(file_bytes, year=2026):
     return pd.DataFrame(txns)
 
 # ==========================================================
-# --- TAB 1: UPLOAD & AUTOMATIC STATEMENT INGESTION ---
+# --- TAB 1: UPLOAD STATEMENTS ---
 # ==========================================================
 with tab_upload:
     st.subheader("📥 Upload Statement (TD Bank Account or TD Visa PDF)")
@@ -170,7 +174,7 @@ with tab_upload:
                 df = pd.read_excel(io.BytesIO(file_bytes))
 
             if df.empty:
-                st.error("No transactions could be extracted. Please check the file.")
+                st.error("No transactions could be extracted. Please verify the file.")
             else:
                 cols = {str(c).strip().lower(): c for c in df.columns}
                 date_col = next((cols[k] for k in ["date", "transaction date", "posting date"] if k in cols), None)
@@ -197,8 +201,11 @@ with tab_upload:
                         except Exception:
                             date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
 
-                        is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "PAYMENT-THANK YOU", "CREDIT CARD BILL"]) else 0
-                        is_fee_rebate = "ACCT BAL REBATE" in desc.upper()
+                        # Normalize spaces for robust keyword matching
+                        desc_nospace = desc.upper().replace(" ", "")
+
+                        is_payment = 1 if any(w in desc_nospace for w in ["TDVISA", "PAYMENT-THANKYOU", "PAYMENTTHANKYOU", "CREDITCARDBILL"]) else 0
+                        is_fee_rebate = "ACCTBALREBATE" in desc_nospace
 
                         if account_type == "Credit Card":
                             if raw_amt < 0 and not is_payment:
@@ -224,27 +231,27 @@ with tab_upload:
                             skipped_count += 1
                             continue
 
-                        # Precise Auto-Categorization
+                        # Precise Auto-Categorization with Space Normalization
                         matched_cat = "Uncategorized"
                         if is_payment:
                             matched_cat = "Card Payment"
-                        elif any(k in desc.upper() for k in ["PTS TO", "TFR-TO", "HL071 TFR", "TRANSFER TO"]):
+                        elif any(k in desc_nospace for k in ["PTSTO", "TFR-TO", "HL071TFR", "TRANSFERTO"]):
                             matched_cat = "Internal Transfer"
-                        elif any(k in desc.upper() for k in ["ACCOUNT FEE", "BAL REBATE", "MONTHLY FEE"]):
+                        elif any(k in desc_nospace for k in ["ACCOUNTFEE", "BALREBATE", "MONTHLYFEE"]):
                             matched_cat = "Bank Acc Charges"
-                        elif any(k in desc.upper() for k in ["HCL CANADA", "PAYROLL", "SALARY"]):
+                        elif any(k in desc_nospace for k in ["HCLCANADA", "PAYROLL", "SALARY"]):
                             matched_cat = "Salary"
-                        elif any(k in desc.upper() for k in ["RIA MONEY", "RIA TRANS"]):
+                        elif any(k in desc_nospace for k in ["RIAMONEY", "RIATRANS", "RIA"]):
                             matched_cat = "Ria"
-                        elif "TD MHA PPP TFS" in desc.upper() or "TD MHA PPP INV" in desc.upper():
+                        elif "TDMHAPPP" in desc_nospace:
                             matched_cat = "Savings"
-                        elif any(k in desc.upper() for k in ["ATM W/D", "ATM WITHDRAWAL"]):
+                        elif any(k in desc_nospace for k in ["ATMW/D", "ATMWITHDRAWAL"]):
                             matched_cat = "Cash"
-                        elif any(k in desc.upper() for k in ["GST", "CANADA PRO", "TAX REFUND", "RIT"]):
+                        elif any(k in desc_nospace for k in ["GST", "CANADAPRO", "TAXREFUND", "RIT"]):
                             matched_cat = "ITR Return"
                         else:
                             for kw, cat in rules.items():
-                                if kw.upper() in desc.upper():
+                                if kw.upper().replace(" ", "") in desc_nospace:
                                     matched_cat = cat
                                     break
 
@@ -291,50 +298,92 @@ with tab_upload:
             st.dataframe(cov[['Month', 'Bank Account', 'Credit Card', 'Status']], use_container_width=True, hide_index=True)
 
 # ==========================================================
-# --- TAB 2: REVIEW UNCATEGORIZED & EXPENSE SPLITTER ---
+# --- TAB 2: EDIT & SPLIT TRANSACTIONS (FLEXIBLE) ---
 # ==========================================================
-with tab_split:
-    st.subheader("📝 Review Uncategorized & Split Group Bills")
+with tab_manage:
+    st.subheader("✏️ Review, Edit Categories & Split Bills")
+    
     with engine.connect() as conn:
-        uncat_tx = pd.read_sql("SELECT id, date, description, amount, account_type FROM transactions WHERE category = 'Uncategorized' ORDER BY date DESC", conn)
+        all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type FROM transactions ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
         assignable_cats = sorted([c for c in cat_map.keys() if c not in ["Card Payment", "Internal Transfer"]])
 
-    if uncat_tx.empty:
-        st.success("🎉 All transactions are categorized!")
+    if all_tx.empty:
+        st.info("No transactions in database yet. Upload a statement first!")
     else:
-        st.write(f"**{len(uncat_tx)}** transactions need categorization:")
-        for _, row in uncat_tx.iterrows():
-            with st.expander(f"📌 {row['date']} | {row['description']} | ${float(row['amount']):.2f} ({row['account_type']})", expanded=True):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write("**Assign Category**")
-                    new_c = st.selectbox("Category", assignable_cats, key=f"cat_sel_{row['id']}")
-                    save_r = st.checkbox("Remember vendor rule", key=f"rule_chk_{row['id']}")
-                    if st.button("Save", key=f"btn_save_{row['id']}"):
+        # Filter controls
+        uncat_count = len(all_tx[all_tx['category'] == 'Uncategorized'])
+        
+        col_f1, col_f2, col_f3 = st.columns([1.5, 1.5, 2])
+        with col_f1:
+            default_view = "Uncategorized Only" if uncat_count > 0 else "All Transactions"
+            view_filter = st.selectbox(
+                "Filter View", 
+                options=[f"Uncategorized Only ({uncat_count} pending)", "All Transactions", "Filter by Category"],
+                index=0 if uncat_count > 0 else 1
+            )
+        
+        with col_f2:
+            if "Filter by Category" in view_filter:
+                selected_cat_filter = st.selectbox("Select Category", options=assignable_cats)
+            else:
+                selected_cat_filter = None
+                
+        with col_f3:
+            search_query = st.text_input("🔍 Search Merchant / Description (e.g. MCD, Tim)", placeholder="Type to search...")
+
+        # Apply filtering
+        df_view = all_tx.copy()
+        if "Uncategorized Only" in view_filter:
+            df_view = df_view[df_view['category'] == 'Uncategorized']
+        elif selected_cat_filter:
+            df_view = df_view[df_view['category'] == selected_cat_filter]
+            
+        if search_query.strip():
+            df_view = df_view[df_view['description'].str.contains(search_query.strip(), case=False, na=False)]
+
+        st.caption(f"Showing **{len(df_view)}** transactions:")
+
+        for _, row in df_view.iterrows():
+            amt_display = f"${float(row['amount']):.2f}"
+            with st.expander(f"📌 {row['date']} | **{row['description']}** | {amt_display} | `Category: {row['category']}` ({row['account_type']})"):
+                c_edit, c_dummy = st.columns([2, 1])
+                
+                with c_edit:
+                    current_idx = assignable_cats.index(row['category']) if row['category'] in assignable_cats else 0
+                    new_selected_cat = st.selectbox("Category", assignable_cats, index=current_idx, key=f"cat_sel_{row['id']}")
+                    
+                    remember_rule = st.checkbox("Remember vendor rule for future uploads", key=f"rule_chk_{row['id']}")
+                    
+                    if st.button("Update Category", key=f"btn_save_{row['id']}"):
                         with engine.connect() as conn:
-                            conn.execute(text("UPDATE transactions SET category = :cat WHERE id = :id"), {"cat": new_c, "id": row['id']})
-                            if save_r:
+                            conn.execute(text("UPDATE transactions SET category = :cat WHERE id = :id"), {"cat": new_selected_cat, "id": row['id']})
+                            if remember_rule:
                                 kw = " ".join(str(row['description']).split()[:2]).upper()
-                                conn.execute(text("INSERT INTO categories (keyword, category) VALUES (:kw, :cat) ON CONFLICT (keyword) DO UPDATE SET category = :cat"), {"kw": kw, "cat": new_c})
+                                conn.execute(text("INSERT INTO categories (keyword, category) VALUES (:kw, :cat) ON CONFLICT (keyword) DO UPDATE SET category = :cat"), {"kw": kw, "cat": new_selected_cat})
                             conn.commit()
+                        st.success(f"Updated to {new_selected_cat}!")
                         st.rerun()
-                with c2:
-                    st.write("**Split Group / Shared Bill**")
+
+                # OPTIONAL SPLIT BILL SECTION (Only expands if user clicks it!)
+                with st.expander("✂️ Want to split this bill with friends? (Click to expand)"):
                     full_amt = float(abs(row['amount']))
-                    my_share = st.number_input("Your Share ($)", min_value=0.0, max_value=full_amt, value=full_amt/2, step=1.0, key=f"sp_my_{row['id']}")
+                    my_share = st.number_input("Your Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
                     fr_share = round(full_amt - my_share, 2)
-                    st.caption(f"Friends Owe You: **${fr_share:.2f}** (Auto-assigned to `Shared Reimbursement`)")
-                    my_cat = st.selectbox("Your Category", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"sp_cat_{row['id']}")
-                    if st.button("Execute Split", key=f"btn_sp_{row['id']}"):
+                    st.info(f"Friends will owe you: **${fr_share:.2f}** (This portion will be marked as `Shared Reimbursement` and will not count as your expense).")
+                    
+                    split_cat = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"sp_cat_{row['id']}")
+                    
+                    if st.button("Confirm & Split Bill", key=f"btn_sp_{row['id']}"):
                         with engine.connect() as conn:
                             conn.execute(text("UPDATE transactions SET amount = :a, category = :c, description = :d WHERE id = :id"), {
-                                "a": my_share, "c": my_cat, "d": f"{row['description']} (My Share)", "id": row['id']
+                                "a": my_share, "c": split_cat, "d": f"{row['description']} (My Share)", "id": row['id']
                             })
                             conn.execute(text("INSERT INTO transactions (date, description, amount, category, account_type, is_payment) VALUES (:d, :desc, :a, 'Shared Reimbursement', :acc, 0)"), {
                                 "d": row['date'], "desc": f"{row['description']} (Friends Share)", "a": fr_share, "acc": row['account_type']
                             })
                             conn.commit()
+                        st.success("Bill split successfully!")
                         st.rerun()
 
 # ==========================================================
@@ -408,13 +457,10 @@ with tab_dashboard:
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
         df_tx['cat_type'] = df_tx['category'].map(cat_map).fillna('Expense')
 
-        # Month order
         all_months = df_tx.sort_values('date')[['Month_Period', 'Month_Str']].drop_duplicates()['Month_Str'].tolist()
 
-        # Strict Filter: Exclude CC Bill Payments, Inter-Account transfers, and fee rebates from living burn rate
         excluded_living = ['Card Payment', 'Credit Card Bill', 'Credit Card Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
         
-        # 1. Living Expenses Matrix
         df_exp_only = df_tx[
             (df_tx['cat_type'] == 'Expense') & 
             (df_tx['is_payment'] == 0) & 
@@ -422,14 +468,12 @@ with tab_dashboard:
             ~((df_tx['account_type'] == 'Bank Account') & (df_tx['category'] == 'Cash'))
         ]
         
-        # Exact categories in order of your 2026 sheet
         ordered_cats = [
             'Food', 'Utilities', 'Va-Al-SM', 'Transportation', 'Entertainment',
             'Cell Phone', 'Clothes', 'Rent', 'Savings', 'Ria', 'Cash',
             'Citizenship', 'India', 'Misc', 'Health'
         ]
         
-        # Build 2026 Master Grid
         pivot_data = []
         for cat in ordered_cats:
             cat_rows = df_tx[df_tx['category'] == cat] if cat in ['Savings', 'Ria', 'Cash'] else df_exp_only[df_exp_only['category'] == cat]
@@ -442,30 +486,25 @@ with tab_dashboard:
 
         grid_df = pd.DataFrame(pivot_data).set_index('Type')
 
-        # Compute Total Spent & Actual Spent
         total_spent_row = {'Type': 'Total Spent'}
         actual_spent_row = {'Type': 'Actual Spent'}
         for m in all_months + ['Total']:
             tot = grid_df[m].sum()
             total_spent_row[m] = round(tot, 2)
-            # Actual spent subtracts Savings & Ria (just like row 29 in your Excel)
             sav = grid_df.loc['Savings', m] if 'Savings' in grid_df.index else 0
             ria = grid_df.loc['Ria', m] if 'Ria' in grid_df.index else 0
             actual_spent_row[m] = round(tot - (sav + ria), 2)
 
-        # Compute Income Row
         df_inc = df_tx[df_tx['category'].isin(['Salary', 'OT', 'Reimbursement', 'ITR Return'])]
         income_row = {'Type': 'Income'}
         for m in all_months:
             income_row[m] = round(df_inc[df_inc['Month_Str'] == m]['amount'].sum(), 2)
         income_row['Total'] = round(sum([income_row[m] for m in all_months]), 2)
 
-        # Compute Left Row (Income - Total Spent)
         left_row = {'Type': 'Left'}
         for m in all_months + ['Total']:
             left_row[m] = round(income_row[m] - total_spent_row[m], 2)
 
-        # Account Split Rows
         cc_row = {'Type': 'Credit Card'}
         ba_row = {'Type': 'Bank Account'}
         cash_acc_row = {'Type': 'Cash'}
@@ -478,11 +517,9 @@ with tab_dashboard:
         ba_row['Total'] = round(sum([ba_row[m] for m in all_months]), 2)
         cash_acc_row['Total'] = round(sum([cash_acc_row[m] for m in all_months]), 2)
 
-        # Append Summary Rows to Display Grid
         summary_rows = [total_spent_row, actual_spent_row, income_row, left_row, cc_row, ba_row, cash_acc_row]
         df_display_2026 = pd.concat([grid_df, pd.DataFrame(summary_rows).set_index('Type')])
 
-        # Verification Row (Formula: Total Spent == Credit Card + Bank Account + Cash)
         check_row = {}
         for m in all_months:
             is_bal = abs(total_spent_row[m] - (cc_row[m] + ba_row[m] + cash_acc_row[m])) < 1.0
@@ -490,7 +527,6 @@ with tab_dashboard:
         check_row['Total'] = "✅ Correct"
         check_df = pd.DataFrame([check_row], index=['Reconciliation Status'])
 
-        # Top Executive Metrics (Latest Month)
         latest_m = all_months[-1]
         st.markdown(f"### 🎯 Summary for **{latest_m}**")
         k1, k2, k3, k4 = st.columns(4)
@@ -504,7 +540,6 @@ with tab_dashboard:
         st.dataframe(df_display_2026.style.format("${:,.2f}"), use_container_width=True)
         st.dataframe(check_df, use_container_width=True)
 
-        # Dedicated Category MoM Drill-down
         st.markdown("---")
         st.subheader("📈 Category Month-on-Month Drilldown")
         inspect_cat = st.selectbox("Select Category to Analyze", options=[c for c in ordered_cats if c in grid_df.index])
