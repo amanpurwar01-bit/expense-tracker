@@ -23,19 +23,27 @@ st.title("💳 Personal Finance & Master Reconciliation Hub")
 
 # Auto-cleanup database on startup
 with engine.connect() as conn:
+    # Ensure Payment is an established category
     conn.execute(text("""
-        UPDATE transactions 
-        SET category = 'Card Payment', is_payment = 1 
-        WHERE category IN ('Credit Card Bill', 'Credit Card Payment')
-           OR description ILIKE '%TD VISA%'
-           OR description ILIKE '%PAYMENT%THANK YOU%';
+        INSERT INTO custom_categories (name, cat_type) VALUES ('Payment', 'Wash/Transfer')
+        ON CONFLICT (name) DO UPDATE SET cat_type = 'Wash/Transfer';
 
+        -- Fix any credit card payments that were mislabeled as Bank Acc Charges
+        UPDATE transactions 
+        SET category = 'Payment', is_payment = 1 
+        WHERE (description ILIKE '%TD VISA%' 
+           OR description ILIKE '%PAYMENT%THANK YOU%' 
+           OR description ILIKE '%PAYMENT-THANK YOU%' 
+           OR description ILIKE '%CREDIT CARD BILL%'
+           OR category IN ('Card Payment', 'Credit Card Bill', 'Credit Card Payment'));
+
+        -- Auto-fix any Ria transfers that were misfiled due to spaces
         UPDATE transactions
         SET category = 'Ria'
         WHERE category = 'Uncategorized'
           AND (description ILIKE '%R ia%' OR description ILIKE '%Ria%');
 
-        DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment');
+        DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment', 'Card Payment');
     """))
     conn.commit()
 
@@ -231,7 +239,7 @@ with tab_upload:
 
                         matched_cat = "Uncategorized"
                         if is_payment:
-                            matched_cat = "Card Payment"
+                            matched_cat = "Payment"
                         elif any(k in desc_nospace for k in ["PTSTO", "TFR-TO", "HL071TFR", "TRANSFERTO"]):
                             matched_cat = "Internal Transfer"
                         elif any(k in desc_nospace for k in ["ACCOUNTFEE", "BALREBATE", "MONTHLYFEE"]):
@@ -283,16 +291,14 @@ with tab_upload:
             audit_df['Period'] = audit_df['date'].dt.to_period('M')
             audit_df['Month'] = audit_df['date'].dt.strftime("%b'%y")
             
-            # Dynamic Year Selection for Upload Coverage
             avail_audit_years = sorted(audit_df['Year'].unique(), reverse=True)
             if 2026 not in avail_audit_years: avail_audit_years.append(2026)
-            if 2027 not in avail_audit_years: avail_audit_years.append(2027)
+            if 2025 not in avail_audit_years: avail_audit_years.append(2025)
             avail_audit_years = sorted(list(set(avail_audit_years)), reverse=True)
             
             with c_cov_yr:
                 selected_audit_year = st.selectbox("Audit Year", options=avail_audit_years, index=avail_audit_years.index(statement_year) if statement_year in avail_audit_years else 0)
 
-            # Filter table strictly to selected year
             audit_year_df = audit_df[audit_df['Year'] == selected_audit_year]
             
             if audit_year_df.empty:
@@ -317,49 +323,92 @@ with tab_upload:
             st.info("No statement data logged yet.")
 
 # ==========================================================
-# --- TAB 2: EDIT & SPLIT TRANSACTIONS ---
+# --- TAB 2: EDIT & SPLIT TRANSACTIONS (DYNAMIC FILTERS) ---
 # ==========================================================
 with tab_manage:
     st.subheader("✏️ Review, Edit Categories & Split Bills")
     
     with engine.connect() as conn:
-        all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type FROM transactions ORDER BY date DESC", conn)
+        all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
-        assignable_cats = sorted([c for c in cat_map.keys() if c not in ["Card Payment", "Internal Transfer"]])
+        
+        # Ensure all existing categories in database are selectable
+        existing_cats = set(cat_map.keys()).union(set(all_tx['category'].dropna().unique()))
+        assignable_cats = sorted([c for c in existing_cats if c != 'Uncategorized'])
 
     if all_tx.empty:
         st.info("No transactions in database yet. Upload a statement first!")
     else:
-        uncat_count = len(all_tx[all_tx['category'] == 'Uncategorized'])
-        
-        col_f1, col_f2, col_f3 = st.columns([1.5, 1.5, 2])
-        with col_f1:
-            view_filter = st.selectbox(
-                "Filter View", 
-                options=[f"Uncategorized Only ({uncat_count} pending)", "All Transactions", "Filter by Category"],
-                index=0 if uncat_count > 0 else 1
-            )
-        
-        with col_f2:
-            if "Filter by Category" in view_filter:
-                selected_cat_filter = st.selectbox("Select Category", options=assignable_cats)
-            else:
-                selected_cat_filter = None
-                
-        with col_f3:
-            search_query = st.text_input("🔍 Search Merchant / Description (e.g. MCD, Tim)", placeholder="Type to search...")
+        all_tx['date'] = pd.to_datetime(all_tx['date'])
+        all_tx['Year'] = all_tx['date'].dt.year
+        all_tx['Month_Str'] = all_tx['date'].dt.strftime("%b'%y")
 
-        # Apply filtering
+        # --- 5-Column Filter Bar ---
+        f_yr, f_mo, f_status, f_cat, f_search = st.columns([1.1, 1.2, 1.6, 1.4, 1.8])
+
+        # 1. Year Filter
+        avail_years = sorted(all_tx['Year'].unique(), reverse=True)
+        year_options = ["All Years"] + [str(y) for y in avail_years]
+        with f_yr:
+            selected_yr = st.selectbox("📅 Year", options=year_options, index=0)
+
+        # 2. Month Filter (Dynamically conditioned on selected year)
+        if selected_yr != "All Years":
+            filtered_by_yr = all_tx[all_tx['Year'] == int(selected_yr)]
+            avail_months = filtered_by_yr.sort_values('date')['Month_Str'].unique().tolist()
+        else:
+            avail_months = all_tx.sort_values('date')['Month_Str'].unique().tolist()
+
+        month_options = ["All Months"] + avail_months
+        with f_mo:
+            selected_mo = st.selectbox("🗓️ Month", options=month_options, index=0)
+
+        # 3. Categorized / Uncategorized Status Selector
+        slice_df = all_tx.copy()
+        if selected_yr != "All Years":
+            slice_df = slice_df[slice_df['Year'] == int(selected_yr)]
+        if selected_mo != "All Months":
+            slice_df = slice_df[slice_df['Month_Str'] == selected_mo]
+
+        uncat_n = len(slice_df[slice_df['category'] == 'Uncategorized'])
+        cat_n = len(slice_df[slice_df['category'] != 'Uncategorized'])
+        total_n = len(slice_df)
+
+        with f_status:
+            status_view = st.selectbox(
+                "🏷️ Status",
+                options=[f"All ({total_n})", f"🚨 Uncategorized ({uncat_n})", f"✅ Categorized ({cat_n})"],
+                index=1 if uncat_n > 0 else 0
+            )
+
+        # 4. Category Filter
+        with f_cat:
+            selected_cat_filter = st.selectbox(
+                "📂 Category",
+                options=["All Categories"] + assignable_cats,
+                index=0
+            )
+
+        # 5. Search Filter
+        with f_search:
+            search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Tim, Uber...")
+
+        # Apply Filters
         df_view = all_tx.copy()
-        if "Uncategorized Only" in view_filter:
+        if selected_yr != "All Years":
+            df_view = df_view[df_view['Year'] == int(selected_yr)]
+        if selected_mo != "All Months":
+            df_view = df_view[df_view['Month_Str'] == selected_mo]
+        if "Uncategorized" in status_view:
             df_view = df_view[df_view['category'] == 'Uncategorized']
-        elif selected_cat_filter:
+        elif "Categorized" in status_view:
+            df_view = df_view[df_view['category'] != 'Uncategorized']
+        if selected_cat_filter != "All Categories":
             df_view = df_view[df_view['category'] == selected_cat_filter]
-            
         if search_query.strip():
             df_view = df_view[df_view['description'].str.contains(search_query.strip(), case=False, na=False)]
 
-        st.caption(f"Showing **{len(df_view)}** transactions:")
+        st.caption(f"Showing **{len(df_view)}** matching transactions:")
 
         # Table Header
         h_left, h_cat, h_btn = st.columns([3.4, 1.8, 0.8])
@@ -372,9 +421,8 @@ with tab_manage:
             
             c_left, c_cat, c_btn = st.columns([3.4, 1.8, 0.8])
             
-            # Left: Details + Dropdown Expander for Splitting
             with c_left:
-                with st.expander(f"📌 {row['date']} | **{row['description']}** | {amt_display} ({row['account_type']})"):
+                with st.expander(f"📌 {row['date'].strftime('%Y-%m-%d')} | **{row['description']}** | {amt_display} ({row['account_type']})"):
                     st.markdown("#### ✂️ Split this bill with friends")
                     full_amt = float(abs(row['amount']))
                     my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
@@ -395,7 +443,6 @@ with tab_manage:
                         st.success("Bill split successfully!")
                         st.rerun()
 
-            # Right: Category dropdown directly accessible
             with c_cat:
                 cur_idx = assignable_cats.index(row['category']) if row['category'] in assignable_cats else 0
                 new_selected_cat = st.selectbox(
@@ -406,11 +453,13 @@ with tab_manage:
                     label_visibility="collapsed"
                 )
 
-            # Action: Save button
             with c_btn:
                 if st.button("Save", key=f"btn_save_{row['id']}"):
+                    is_pay = 1 if new_selected_cat == 'Payment' else 0
                     with engine.connect() as conn:
-                        conn.execute(text("UPDATE transactions SET category = :cat WHERE id = :id"), {"cat": new_selected_cat, "id": row['id']})
+                        conn.execute(text("UPDATE transactions SET category = :cat, is_payment = :pay WHERE id = :id"), {
+                            "cat": new_selected_cat, "pay": is_pay, "id": row['id']
+                        })
                         conn.commit()
                     st.success("Saved!")
                     st.rerun()
@@ -486,7 +535,6 @@ with tab_dashboard:
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
         df_tx['cat_type'] = df_tx['category'].map(cat_map).fillna('Expense')
 
-        # Year Selector for Dashboard
         dash_years = sorted(df_tx['Year'].unique(), reverse=True)
         if 2026 not in dash_years: dash_years.append(2026)
         dash_years = sorted(list(set(dash_years)), reverse=True)
@@ -495,14 +543,13 @@ with tab_dashboard:
         with d_col1:
             selected_dash_year = st.selectbox("📅 Select Budget Year", options=dash_years, index=0)
 
-        # Filter by selected budget year
         df_tx_year = df_tx[df_tx['Year'] == selected_dash_year]
         all_months = df_tx_year.sort_values('date')[['Month_Period', 'Month_Str']].drop_duplicates()['Month_Str'].tolist()
 
         if not all_months:
             st.info(f"No transactions recorded for {selected_dash_year} yet.")
         else:
-            excluded_living = ['Card Payment', 'Credit Card Bill', 'Credit Card Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
+            excluded_living = ['Payment', 'Card Payment', 'Credit Card Bill', 'Credit Card Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
             
             df_exp_only = df_tx_year[
                 (df_tx_year['cat_type'] == 'Expense') & 
@@ -554,7 +601,7 @@ with tab_dashboard:
             for m in all_months:
                 m_tx = df_tx_year[df_tx_year['Month_Str'] == m]
                 cc_row[m] = round(m_tx[(m_tx['account_type'] == 'Credit Card') & (m_tx['is_payment'] == 0)]['amount'].sum(), 2)
-                ba_row[m] = round(m_tx[(m_tx['account_type'] == 'Bank Account') & (m_tx['is_payment'] == 0) & (~m_tx['category'].isin(['Bank Acc Charges', 'Internal Transfer']))]['amount'].sum(), 2)
+                ba_row[m] = round(m_tx[(m_tx['account_type'] == 'Bank Account') & (m_tx['is_payment'] == 0) & (~m_tx['category'].isin(['Bank Acc Charges', 'Internal Transfer', 'Payment']))]['amount'].sum(), 2)
                 cash_acc_row[m] = round(m_tx[(m_tx['account_type'] == 'Cash')]['amount'].sum(), 2)
             cc_row['Total'] = round(sum([cc_row[m] for m in all_months]), 2)
             ba_row['Total'] = round(sum([ba_row[m] for m in all_months]), 2)
