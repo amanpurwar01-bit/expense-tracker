@@ -13,9 +13,9 @@ engine = create_engine(
 )
 
 st.set_page_config(page_title="Personal Finance Hub", layout="wide", page_icon="💳")
-st.title("💳 Expense, Cash & Wealth Tracker")
+st.title("💳 Personal Finance & Wealth Reconciliation Hub")
 
-# Ensure database schema supports extended tracking
+# Automated Database Migration & Schema Setup
 with engine.connect() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS custom_categories (
@@ -37,18 +37,24 @@ with engine.connect() as conn:
         );
         ALTER TABLE custom_categories ADD COLUMN IF NOT EXISTS cat_type TEXT DEFAULT 'Expense';
     """))
-    
-    # Pre-seed categories with structural types
+
+    # Remove deprecated categories from category pickers
+    conn.execute(text("DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment')"))
+
+    # Seed core structural categories
     seed_categories = [
         # Living Expenses
         ('Food', 'Expense'), ('Va-Al-SM', 'Expense'), ('Transportation', 'Expense'),
         ('Utilities', 'Expense'), ('Cell Phone', 'Expense'), ('Clothes', 'Expense'),
         ('Entertainment', 'Expense'), ('Rent', 'Expense'), ('Health', 'Expense'),
         ('Misc', 'Expense'), ('Citizenship', 'Expense'),
-        # Wealth & Remittances (Excluded from living expenses)
+        # Wealth & Remittances
         ('TFSA', 'Wealth/Savings'), ('FHSA', 'Wealth/Savings'), ('Savings', 'Wealth/Savings'),
-        ('Sent to India', 'Remittance'), ('Cash', 'Wash/Transfer'), ('Bank Acc Charges', 'Wash/Transfer'),
-        ('Shared Reimbursement', 'Wash/Transfer'),
+        ('Sent to India', 'Remittance'),
+        # Wash & Non-Living Balances
+        ('Internal Transfer', 'Wash/Transfer'), ('Cash', 'Wash/Transfer'), 
+        ('Bank Acc Charges', 'Wash/Transfer'), ('Shared Reimbursement', 'Wash/Transfer'),
+        ('Card Payment', 'Wash/Transfer'),
         # Income Streams
         ('Salary', 'Income'), ('OT', 'Income'), ('Reimbursement', 'Income'), ('ITR Return', 'Income')
     ]
@@ -60,18 +66,18 @@ with engine.connect() as conn:
         """), {"name": cat_name, "type": ctype})
     conn.commit()
 
-# Application Tabs
+# Primary Tabs
 tab_upload, tab_split, tab_cash, tab_dashboard, tab_rules = st.tabs([
     "📥 Upload & Coverage", "✂️ Review & Split Expenses", "💵 Cash Wallet", "📊 Financial Dashboard", "⚙️ Category & Auto-Rules"
 ])
 
 def get_categories_dict(conn):
-    """Returns mapping of category name to its operational type."""
+    """Returns mapping of category name to its functional type."""
     rows = conn.execute(text("SELECT name, cat_type FROM custom_categories ORDER BY name")).fetchall()
     return {r[0]: r[1] for r in rows}
 
 def parse_pdf_statement(file):
-    """Extracts date, description, and directional amounts from bank and credit card statements."""
+    """Extracts date, description, and directional amounts from statements."""
     records = []
     date_regex = re.compile(
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{1,2}[/-]\d{1,2}|\d{4}[/-]\d{2}[/-]\d{2})",
@@ -116,7 +122,7 @@ def parse_pdf_statement(file):
     return pd.DataFrame(records)
 
 def generate_excel_download(df_raw, living_pivot=None, wealth_pivot=None, inc_pivot=None):
-    """Generates structured multi-sheet Excel export."""
+    """Builds a multi-tab Excel spreadsheet for download."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_export = df_raw.copy()
@@ -136,11 +142,11 @@ def generate_excel_download(df_raw, living_pivot=None, wealth_pivot=None, inc_pi
             inc_pivot.to_excel(writer, sheet_name='Income')
     return output.getvalue()
 
-# ==========================================
-# --- TAB 1: UPLOAD & COVERAGE CHECKLIST ---
-# ==========================================
+# ==========================================================
+# --- TAB 1: STATEMENT IMPORT & UPLOAD COVERAGE AUDIT ---
+# ==========================================================
 with tab_upload:
-    st.subheader("Statement Upload & Audit Checklist")
+    st.subheader("Statement Upload & Coverage Checklist")
     c_up, c_cov = st.columns([1.2, 1.8])
     
     with c_up:
@@ -164,7 +170,7 @@ with tab_upload:
                 amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit", "deposit", "amount (s)"] if k in cols), None)
 
                 if not (date_col and desc_col and amt_col):
-                    st.error(f"Missing essential columns. Identified: {list(df.columns)}")
+                    st.error(f"Missing required columns. Found: {list(df.columns)}")
                 else:
                     with engine.connect() as conn:
                         rules = dict(conn.execute(text("SELECT keyword, category FROM categories")).fetchall())
@@ -186,30 +192,27 @@ with tab_upload:
                             except Exception:
                                 date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
 
-                            # Determine directional sign and category
+                            # Credit card payment detection
                             is_payment = 1 if any(w in desc.upper() for w in ["TD VISA", "PAYMENT - THANK YOU", "PAYMENT-THANK YOU", "CREDIT CARD BILL"]) else 0
                             
-                            # Bank Fee Offset Handling
+                            # Bank balance fee rebate detection
                             is_fee_rebate = "ACCT BAL REBATE" in desc.upper()
-                            
-                            # Normalize transaction amount
+
+                            # Directional sign handling
                             if account_type == "Credit Card":
-                                # Negative on CC that is not payment = Merchant Refund
+                                # Refund on card: negative amount that is not a payment credit
                                 if raw_amt < 0 and not is_payment:
-                                    final_amt = raw_amt  # Keep negative to offset spending
-                                    is_refund = True
+                                    final_amt = raw_amt
                                 else:
                                     final_amt = abs(raw_amt)
-                                    is_refund = False
                             else:
-                                # Bank: Fee rebate is negative to offset account fee
+                                # Bank: Fee rebate is negative to cleanly wash the account fee
                                 if is_fee_rebate:
                                     final_amt = -abs(raw_amt)
                                 else:
                                     final_amt = abs(raw_amt)
-                                is_refund = False
 
-                            # Frequency-based duplicate prevention
+                            # Frequency-based duplicate check
                             tx_key = (date_str, desc, final_amt, account_type)
                             file_seen_counts[tx_key] = file_seen_counts.get(tx_key, 0) + 1
                             current_occurrence = file_seen_counts[tx_key]
@@ -223,10 +226,12 @@ with tab_upload:
                                 skipped_count += 1
                                 continue
 
-                            # Auto-routing rules
+                            # Comprehensive Auto-Routing
                             matched_cat = "Uncategorized"
                             if is_payment:
-                                matched_cat = "Credit Card Bill"
+                                matched_cat = "Card Payment"
+                            elif any(k in desc.upper() for k in ["PTS TO", "TFR-TO", "HL071 TFR", "TRANSFER TO"]):
+                                matched_cat = "Internal Transfer"
                             elif any(k in desc.upper() for k in ["ACCOUNT FEE", "BAL REBATE", "MONTHLY FEE"]):
                                 matched_cat = "Bank Acc Charges"
                             elif any(k in desc.upper() for k in ["HCL CANADA", "PAYROLL", "SALARY"]):
@@ -259,7 +264,7 @@ with tab_upload:
                         conn.commit()
 
                     if imported_count > 0:
-                        st.success(f"Imported {imported_count} new entries! (Skipped {skipped_count} existing duplicates)")
+                        st.success(f"Successfully imported {imported_count} new entries! (Skipped {skipped_count} existing duplicates)")
                     else:
                         st.info(f"All {skipped_count} transactions in this statement already exist in the database.")
                     st.rerun()
@@ -293,30 +298,29 @@ with tab_upload:
             cov['Credit Card'] = cov['Credit Card'].apply(lambda x: f"✅ {x} txns" if x > 0 else "❌ Missing")
             st.dataframe(cov[['Month', 'Bank Account', 'Credit Card', 'Status']], use_container_width=True, hide_index=True)
 
-# ====================================================
-# --- TAB 2: REVIEW UNCATEGORIZED & EXPENSE SPLIT ---
-# ====================================================
+# ========================================================
+# --- TAB 2: REVIEW UNCATEGORIZED & BILL SPLITTER ---
+# ========================================================
 with tab_split:
     st.subheader("📝 Categorization & Shared Expense Splitter")
     
     with engine.connect() as conn:
         uncat_tx = pd.read_sql("SELECT id, date, description, amount, account_type FROM transactions WHERE category = 'Uncategorized' ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
-        active_cats = sorted(list(cat_map.keys()))
+        assignable_cats = sorted([c for c in cat_map.keys() if c not in ["Card Payment", "Internal Transfer"]])
 
     if uncat_tx.empty:
         st.success("🎉 All uploaded transactions are fully categorized!")
     else:
-        st.write(f"**{len(uncat_tx)}** transactions need categorization or splitting:")
+        st.write(f"**{len(uncat_tx)}** transactions require category assignment:")
         
         for _, row in uncat_tx.iterrows():
             with st.expander(f"📌 {row['date']} | {row['description']} | ${row['amount']:.2f} ({row['account_type']})", expanded=True):
                 col_std, col_split = st.columns([1.2, 1.2])
                 
-                # Standard Direct Categorization
                 with col_std:
                     st.write("**Direct Category Assignment**")
-                    selected_cat = st.selectbox("Assign Category", active_cats, key=f"sel_{row['id']}")
+                    selected_cat = st.selectbox("Assign Category", assignable_cats, key=f"sel_{row['id']}")
                     rem_vendor = st.checkbox("Remember Vendor Rule", key=f"rem_{row['id']}", value=False)
                     if st.button("Save Assignment", key=f"btn_save_{row['id']}"):
                         with engine.connect() as conn:
@@ -327,17 +331,15 @@ with tab_split:
                             conn.commit()
                         st.rerun()
 
-                # Shared Group Bill Splitter
                 with col_split:
                     st.write("**✂️ Split Group / Shared Bill**")
                     my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=float(abs(row['amount'])), value=float(abs(row['amount']))/2, step=1.0, key=f"split_my_{row['id']}")
                     friends_share = round(float(abs(row['amount'])) - my_share, 2)
                     st.caption(f"Reimbursable by Friends: **${friends_share:.2f}** (Auto-assigned to `Shared Reimbursement`)")
-                    my_category = st.selectbox("Category for Your Share", [c for c in active_cats if cat_map[c] == 'Expense'], key=f"split_cat_{row['id']}")
+                    my_category = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map[c] == 'Expense'], key=f"split_cat_{row['id']}")
                     
                     if st.button("Execute Bill Split", key=f"btn_split_{row['id']}"):
                         with engine.connect() as conn:
-                            # 1. Update original record to personal share
                             conn.execute(text("""
                                 UPDATE transactions 
                                 SET amount = :my_amt, category = :my_cat, description = :desc 
@@ -348,7 +350,6 @@ with tab_split:
                                 "desc": f"{row['description']} (My Share)", 
                                 "id": row['id']
                             })
-                            # 2. Insert separate row for friend reimbursable share
                             conn.execute(text("""
                                 INSERT INTO transactions (date, description, amount, category, account_type, is_payment)
                                 VALUES (:date, :desc, :amt, 'Shared Reimbursement', :acc, 0)
@@ -359,7 +360,7 @@ with tab_split:
                                 "acc": row['account_type']
                             })
                             conn.commit()
-                        st.success("Transaction split into personal share and friend reimbursable!")
+                        st.success("Split completed successfully!")
                         st.rerun()
 
 # ==========================================
@@ -389,7 +390,7 @@ with tab_cash:
         st.write("#### ✍️ Log Cash Expense")
         with st.form("cash_spend_form", clear_on_submit=True):
             c_date = st.date_input("Date Spent")
-            c_desc = st.text_input("Merchant / Description", placeholder="e.g. Barber, Fruit vendor, Cash tip")
+            c_desc = st.text_input("Merchant / Description", placeholder="e.g. Barber, Grocery stall, Cash tip")
             c_amt = st.number_input("Amount ($)", min_value=0.50, max_value=max(cash_in_hand, 5000.0), step=1.0)
             c_cat = st.selectbox("Category", spending_cats)
             if st.form_submit_button("Record Cash Expense"):
@@ -419,18 +420,20 @@ with tab_cash:
                         conn.commit()
                     st.rerun()
 
-# ====================================================
-# --- TAB 4: INTERACTIVE DASHBOARD & WEALTH METRICS ---
-# ====================================================
+# ========================================================
+# --- TAB 4: FINANCIAL DASHBOARD & DRILL-DOWN ANALYTICS ---
+# ========================================================
 with tab_dashboard:
     with engine.connect() as conn:
         df_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions", conn)
         cc_charges = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 0")).scalar()
-        cc_payments = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE is_payment = 1")).scalar()
+        cc_payments_bank = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Bank Account' AND is_payment = 1")).scalar()
+        cc_payments_card = conn.execute(text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_type = 'Credit Card' AND is_payment = 1")).scalar()
+        cc_payments = max(float(cc_payments_bank), float(cc_payments_card))
         cat_map = get_categories_dict(conn)
 
     if df_tx.empty:
-        st.info("No transactions available. Import bank or credit card statements to view analytics.")
+        st.info("No transactions found in database. Please upload bank or credit card statements.")
     else:
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Year'] = df_tx['date'].dt.year
@@ -438,7 +441,7 @@ with tab_dashboard:
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
         df_tx['cat_type'] = df_tx['category'].map(cat_map).fillna('Expense')
 
-        # --- Filter Controls ---
+        # Filter Bar
         st.markdown("### 🔍 Dashboard Filters & Data Export")
         f1, f2, f3 = st.columns([1.5, 1.5, 1.5])
         
@@ -453,7 +456,7 @@ with tab_dashboard:
 
         df_filtered = df_tx[(df_tx['Year'].isin(selected_years)) & (df_tx['Month_Str'].isin(selected_months))]
 
-        # Exclude Bank Cash W/D (wash transfer to wallet) from living expenses
+        # Strict Living Expenses (Excludes ATM cash withdrawal wash, Card Payments, and Internal Transfers)
         df_living = df_filtered[
             (df_filtered['cat_type'] == 'Expense') & 
             (df_filtered['is_payment'] == 0) &
@@ -486,7 +489,7 @@ with tab_dashboard:
             xl_bytes = generate_excel_download(df_filtered, living_pivot, wealth_pivot, inc_pivot)
             st.download_button("📥 Download Excel Report (.xlsx)", data=xl_bytes, file_name="Financial_Summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
-        # --- Top Executive Metrics ---
+        # Executive Metrics
         st.markdown("---")
         m1, m2, m3, m4 = st.columns(4)
         tot_living = df_living['amount'].sum()
@@ -499,7 +502,7 @@ with tab_dashboard:
         m3.metric("Net Operational Savings", f"${net_saved:,.2f}", delta=net_saved)
         m4.metric("Unpaid Credit Card Balance", f"${unpaid_cc:,.2f}", delta=-unpaid_cc, delta_color="inverse")
 
-        # --- Dedicated Wealth & Remittance KPIs ---
+        # Wealth Accumulation & Remittances Cards
         st.markdown("---")
         st.write("#### 🛡️ Wealth Accumulation & Remittances")
         w1, w2, w3, w4 = st.columns(4)
@@ -507,8 +510,6 @@ with tab_dashboard:
         tfsa_tot = df_tx[df_tx['category'] == 'TFSA']['amount'].sum()
         fhsa_tot = df_tx[df_tx['category'] == 'FHSA']['amount'].sum()
         ria_tot = df_tx[df_tx['category'] == 'Sent to India']['amount'].sum()
-        
-        # Shared Reimbursement Audit (Positive means friends still owe you money)
         shared_owed = df_tx[df_tx['category'] == 'Shared Reimbursement']['amount'].sum()
 
         w1.metric("TFSA Contributions", f"${tfsa_tot:,.2f}")
@@ -516,70 +517,116 @@ with tab_dashboard:
         w3.metric("Sent to India (Ria)", f"${ria_tot:,.2f}")
         w4.metric("Friend Reimbursements Due", f"${shared_owed:,.2f}", delta=-shared_owed if shared_owed > 0 else 0, delta_color="inverse")
         
-        # FHSA Contribution Progress
         fhsa_cap = 8000.0
         st.caption(f"FHSA Annual Room Used: ${fhsa_tot:,.2f} /${fhsa_cap:,.2f} ({min(fhsa_tot/fhsa_cap, 1.0)*100:.1f}%)")
         st.progress(min(max(fhsa_tot / fhsa_cap, 0.0), 1.0))
 
-        # --- Living Expenses Breakdown ---
+        # Overall Living Expenses Breakdown
         st.markdown("---")
-        st.subheader("🛒 Living Expenses Breakdown")
-        
+        st.subheader("🛒 Monthly Living Expenses Breakdown")
         if not living_pivot.empty:
             st.dataframe(living_pivot.style.format("${:,.2f}"), use_container_width=True)
-            
-            # MoM Living Expense Chart
             mom_agg = df_living.groupby(['Month_Period', 'Month_Str'])['amount'].sum().reset_index().sort_values('Month_Period')
             st.bar_chart(mom_agg.set_index('Month_Str')[['amount']].rename(columns={'amount': 'Monthly Living Spend ($)'}))
 
-        # --- Wealth & Remittance Table ---
+        # -------------------------------------------------------------
+        # --- DEDICATED CATEGORY TREND INSPECTOR & DEEP DIVE ---
+        # -------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("🎯 Category MoM Trend & Deep-Dive Analyzer")
+        
+        living_cats = sorted(df_living['category'].unique())
+        if living_cats:
+            inspect_cat = st.selectbox("Select a Category to Analyze Month-on-Month", options=living_cats)
+            
+            df_cat = df_living[df_living['category'] == inspect_cat]
+            cat_mom = df_cat.groupby(['Month_Period', 'Month_Str'])['amount'].sum().reset_index().sort_values('Month_Period')
+            
+            # Align with complete chronological months
+            cat_mom_full = pd.DataFrame({'Month_Str': month_order})
+            cat_mom_full = cat_mom_full.merge(cat_mom[['Month_Str', 'amount']], on='Month_Str', how='left').fillna(0)
+            
+            total_cat_spend = df_cat['amount'].sum()
+            avg_cat_spend = total_cat_spend / max(len(month_order), 1)
+            
+            # Compute latest MoM Delta
+            if len(cat_mom_full) >= 2:
+                latest_amt = cat_mom_full.iloc[-1]['amount']
+                prev_amt = cat_mom_full.iloc[-2]['amount']
+                delta_val = latest_amt - prev_amt
+                delta_str = f"${delta_val:+,.2f} vs {cat_mom_full.iloc[-2]['Month_Str']}"
+            else:
+                delta_str = "N/A (Single Month)"
+
+            ci1, ci2, ci3 = st.columns(3)
+            ci1.metric(f"Total Spent ({inspect_cat})", f"${total_cat_spend:,.2f}")
+            ci2.metric("Average Monthly Spend", f"${avg_cat_spend:,.2f}")
+            ci3.metric("Latest Month-on-Month Change", delta_str)
+
+            # MoM Visual Trend
+            st.write(f"#### 📈 {inspect_cat} Spending Trajectory")
+            chart_series = cat_mom_full.set_index('Month_Str')[['amount']].rename(columns={'amount': f'{inspect_cat} Spend ($)'})
+            st.bar_chart(chart_series)
+
+            # Detailed Transaction Audit Trail
+            st.write(f"#### 📜 Transaction History for {inspect_cat}")
+            cat_table = (
+                df_cat[['date', 'description', 'amount', 'account_type']]
+                .sort_values('date', ascending=False)
+                .assign(Date=lambda x: x['date'].dt.strftime("%Y-%m-%d"))
+                .rename(columns={'description': 'Merchant / Description', 'amount': 'Amount ($)', 'account_type': 'Account'})
+                [['Date', 'Merchant / Description', 'Amount ($)', 'Account']]
+            )
+            st.dataframe(cat_table.style.format({'Amount ($)': "${:,.2f}"}), use_container_width=True, hide_index=True)
+
+        # Wealth & Remittance Table
         if not wealth_pivot.empty:
             st.markdown("---")
-            st.subheader("📈 Wealth Building & Transfers Breakdown")
+            st.subheader("📈 Wealth Building & Remittances Breakdown")
             st.dataframe(wealth_pivot.style.format("${:,.2f}"), use_container_width=True)
 
-        # --- Income Breakdown ---
+        # Income Breakdown Table
         if not inc_pivot.empty:
             st.markdown("---")
-            st.subheader("💵 Income Stream Breakdown")
+            st.subheader("💵 Income Streams Breakdown")
             st.dataframe(inc_pivot.style.format("${:,.2f}"), use_container_width=True)
 
 # ===================================================
-# --- TAB 5: CATEGORY & KEYWORD AUTO-RULE MANAGER ---
+# --- TAB 5: CATEGORIES & AUTO-RULES ENGINE ---
 # ===================================================
 with tab_rules:
-    st.subheader("⚙️ Categories & Keyword Auto-Routing Engine")
+    st.subheader("⚙️ Category Definitions & Keyword Engine")
     cr_left, cr_right = st.columns(2)
     
     with cr_left:
-        st.write("#### 📂 Master Category Definitions")
+        st.write("#### 📂 Master Categories")
         with engine.connect() as conn:
             all_cats_df = pd.read_sql("SELECT name AS Category, cat_type AS Type FROM custom_categories ORDER BY cat_type, name", conn)
-        st.dataframe(all_cats_df, use_container_width=True)
+        st.dataframe(all_cats_df, use_container_width=True, hide_index=True)
         
-        st.write("##### Add Custom Category")
+        st.write("##### Add New Custom Category")
         new_c_name = st.text_input("New Category Name")
         new_c_type = st.selectbox("Category Nature", ["Expense", "Income", "Wealth/Savings", "Remittance", "Wash/Transfer"])
-        if st.button("Add to Master Categories"):
+        if st.button("Add Category"):
             if new_c_name.strip():
                 with engine.connect() as conn:
                     conn.execute(text("INSERT INTO custom_categories (name, cat_type) VALUES (:name, :type) ON CONFLICT (name) DO UPDATE SET cat_type = :type"), {
                         "name": new_c_name.strip(), "type": new_c_type
                     })
                     conn.commit()
-                st.success(f"Category '{new_c_name.strip()}' configured as {new_c_type}!")
+                st.success(f"Added '{new_c_name.strip()}' as {new_c_type}!")
                 st.rerun()
 
     with cr_right:
         st.write("#### 🔍 Keyword Auto-Rules")
         with engine.connect() as conn:
             rules_df = pd.read_sql("SELECT keyword AS Keyword, category AS Category FROM categories ORDER BY Category", conn)
-        st.dataframe(rules_df, use_container_width=True)
+        st.dataframe(rules_df, use_container_width=True, hide_index=True)
         
-        st.write("##### Create Custom Vendor Keyword")
-        kw_text = st.text_input("Vendor Keyword (e.g., UBEREATS, SHELL)")
+        st.write("##### Add Custom Keyword Auto-Rule")
+        kw_text = st.text_input("Vendor Keyword (e.g., UBEREATS, PRESTO)")
         with engine.connect() as conn:
-            available_rule_cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories ORDER BY name")).fetchall()]
+            available_rule_cats = [r[0] for r in conn.execute(text("SELECT name FROM custom_categories WHERE cat_type != 'Wash/Transfer' ORDER BY name")).fetchall()]
         kw_target_cat = st.selectbox("Target Category", available_rule_cats)
         if st.button("Save Keyword Rule"):
             if kw_text.strip():
@@ -588,5 +635,5 @@ with tab_rules:
                         "kw": kw_text.strip().upper(), "cat": kw_target_cat
                     })
                     conn.commit()
-                st.success(f"Rule established: '{kw_text.strip().upper()}' ➔ '{kw_target_cat}'")
+                st.success(f"Rule added: '{kw_text.strip().upper()}' ➔ '{kw_target_cat}'")
                 st.rerun()
