@@ -23,7 +23,6 @@ st.title("💳 Personal Finance & Master Reconciliation Hub")
 
 # Auto-cleanup database on startup
 with engine.connect() as conn:
-    # Ensure Payment is an established category
     conn.execute(text("""
         INSERT INTO custom_categories (name, cat_type) VALUES ('Payment', 'Wash/Transfer')
         ON CONFLICT (name) DO UPDATE SET cat_type = 'Wash/Transfer';
@@ -332,7 +331,6 @@ with tab_manage:
         all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
         
-        # Ensure all existing categories in database are selectable
         existing_cats = set(cat_map.keys()).union(set(all_tx['category'].dropna().unique()))
         assignable_cats = sorted([c for c in existing_cats if c != 'Uncategorized'])
 
@@ -346,13 +344,11 @@ with tab_manage:
         # --- 5-Column Filter Bar ---
         f_yr, f_mo, f_status, f_cat, f_search = st.columns([1.1, 1.2, 1.6, 1.4, 1.8])
 
-        # 1. Year Filter
         avail_years = sorted(all_tx['Year'].unique(), reverse=True)
         year_options = ["All Years"] + [str(y) for y in avail_years]
         with f_yr:
             selected_yr = st.selectbox("📅 Year", options=year_options, index=0)
 
-        # 2. Month Filter (Dynamically conditioned on selected year)
         if selected_yr != "All Years":
             filtered_by_yr = all_tx[all_tx['Year'] == int(selected_yr)]
             avail_months = filtered_by_yr.sort_values('date')['Month_Str'].unique().tolist()
@@ -363,7 +359,6 @@ with tab_manage:
         with f_mo:
             selected_mo = st.selectbox("🗓️ Month", options=month_options, index=0)
 
-        # 3. Categorized / Uncategorized Status Selector
         slice_df = all_tx.copy()
         if selected_yr != "All Years":
             slice_df = slice_df[slice_df['Year'] == int(selected_yr)]
@@ -381,7 +376,6 @@ with tab_manage:
                 index=1 if uncat_n > 0 else 0
             )
 
-        # 4. Category Filter
         with f_cat:
             selected_cat_filter = st.selectbox(
                 "📂 Category",
@@ -389,11 +383,9 @@ with tab_manage:
                 index=0
             )
 
-        # 5. Search Filter
         with f_search:
             search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Tim, Uber...")
 
-        # Apply Filters
         df_view = all_tx.copy()
         if selected_yr != "All Years":
             df_view = df_view[df_view['Year'] == int(selected_yr)]
@@ -410,7 +402,6 @@ with tab_manage:
 
         st.caption(f"Showing **{len(df_view)}** matching transactions:")
 
-        # Table Header
         h_left, h_cat, h_btn = st.columns([3.4, 1.8, 0.8])
         h_left.markdown("**Transaction Details** *(Click dropdown to split)*")
         h_cat.markdown("**Category**")
@@ -418,7 +409,6 @@ with tab_manage:
 
         for _, row in df_view.iterrows():
             amt_display = f"${float(row['amount']):.2f}"
-            
             c_left, c_cat, c_btn = st.columns([3.4, 1.8, 0.8])
             
             with c_left:
@@ -539,7 +529,7 @@ with tab_dashboard:
         if 2026 not in dash_years: dash_years.append(2026)
         dash_years = sorted(list(set(dash_years)), reverse=True)
 
-        d_col1, d_col2 = st.columns([1.5, 3])
+        d_col1, _ = st.columns([1.5, 3])
         with d_col1:
             selected_dash_year = st.selectbox("📅 Select Budget Year", options=dash_years, index=0)
 
@@ -549,24 +539,18 @@ with tab_dashboard:
         if not all_months:
             st.info(f"No transactions recorded for {selected_dash_year} yet.")
         else:
-            excluded_living = ['Payment', 'Card Payment', 'Credit Card Bill', 'Credit Card Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
-            
-            df_exp_only = df_tx_year[
-                (df_tx_year['cat_type'] == 'Expense') & 
-                (df_tx_year['is_payment'] == 0) & 
-                (~df_tx_year['category'].isin(excluded_living)) &
-                ~((df_tx_year['account_type'] == 'Bank Account') & (df_tx_year['category'] == 'Cash'))
-            ]
-            
+            # Categories in exact order of Excel 2026 sheet
             ordered_cats = [
                 'Food', 'Utilities', 'Va-Al-SM', 'Transportation', 'Entertainment',
                 'Cell Phone', 'Clothes', 'Rent', 'Savings', 'Ria', 'Cash',
                 'Citizenship', 'India', 'Misc', 'Health'
             ]
             
+            # --- 1. TABLE 1: MASTER CATEGORY OUTFLOWS ---
+            st.subheader(f"📋 1. {selected_dash_year} Master Category Outflows")
             pivot_data = []
             for cat in ordered_cats:
-                cat_rows = df_tx_year[df_tx_year['category'] == cat] if cat in ['Savings', 'Ria', 'Cash'] else df_exp_only[df_exp_only['category'] == cat]
+                cat_rows = df_tx_year[df_tx_year['category'] == cat]
                 row_dict = {'Type': cat}
                 for m in all_months:
                     val = cat_rows[cat_rows['Month_Str'] == m]['amount'].sum()
@@ -575,73 +559,112 @@ with tab_dashboard:
                 pivot_data.append(row_dict)
 
             grid_df = pd.DataFrame(pivot_data).set_index('Type')
+            st.dataframe(grid_df.style.format("${:,.2f}"), use_container_width=True)
 
-            total_spent_row = {'Type': 'Total Spent'}
-            actual_spent_row = {'Type': 'Actual Spent'}
-            for m in all_months + ['Total']:
-                tot = grid_df[m].sum()
-                total_spent_row[m] = round(tot, 2)
-                sav = grid_df.loc['Savings', m] if 'Savings' in grid_df.index else 0
-                ria = grid_df.loc['Ria', m] if 'Ria' in grid_df.index else 0
-                actual_spent_row[m] = round(tot - (sav + ria), 2)
+            # --- 2. TABLE 2: MONTHLY FINANCIAL SUMMARY ---
+            st.subheader("💵 2. Monthly Financial Summary")
+            
+            total_spent_row = {'Metric': 'Total Spent'}
+            actual_spent_row = {'Metric': 'Actual Spent (Excl. Savings & Ria)'}
+            income_row = {'Metric': 'Total Income'}
+            left_row = {'Metric': 'Net Left (Savings Balance)'}
 
-            df_inc = df_tx_year[df_tx_year['category'].isin(['Salary', 'OT', 'Reimbursement', 'ITR Return'])]
-            income_row = {'Type': 'Income'}
+            df_inc = df_tx_year[df_tx_year['cat_type'] == 'Income']
+
             for m in all_months:
-                income_row[m] = round(df_inc[df_inc['Month_Str'] == m]['amount'].sum(), 2)
+                tot = grid_df[m].sum()
+                sav = grid_df.loc['Savings', m] if 'Savings' in grid_df.index else 0.0
+                ria = grid_df.loc['Ria', m] if 'Ria' in grid_df.index else 0.0
+                inc = df_inc[df_inc['Month_Str'] == m]['amount'].sum()
+
+                total_spent_row[m] = round(tot, 2)
+                actual_spent_row[m] = round(tot - (sav + ria), 2)
+                income_row[m] = round(inc, 2)
+                left_row[m] = round(inc - tot, 2)
+
+            total_spent_row['Total'] = round(sum([total_spent_row[m] for m in all_months]), 2)
+            actual_spent_row['Total'] = round(sum([actual_spent_row[m] for m in all_months]), 2)
             income_row['Total'] = round(sum([income_row[m] for m in all_months]), 2)
+            left_row['Total'] = round(income_row['Total'] - total_spent_row['Total'], 2)
 
-            left_row = {'Type': 'Left'}
-            for m in all_months + ['Total']:
-                left_row[m] = round(income_row[m] - total_spent_row[m], 2)
+            summary_df = pd.DataFrame([total_spent_row, actual_spent_row, income_row, left_row]).set_index('Metric')
+            st.dataframe(summary_df.style.format("${:,.2f}"), use_container_width=True)
 
-            cc_row = {'Type': 'Credit Card'}
-            ba_row = {'Type': 'Bank Account'}
-            cash_acc_row = {'Type': 'Cash'}
+            # --- 3. TABLE 3: PAYMENT SOURCES & RECONCILIATION AUDIT ---
+            st.subheader("⚖️ 3. Payment Sources & Reconciliation Audit")
+            
+            cc_row = {'Source': 'Credit Card'}
+            ba_row = {'Source': 'Bank Account'}
+            cash_acc_row = {'Source': 'Cash'}
+            outflow_sum_row = {'Source': 'Total Account Outflows'}
+            recon_status_row = {'Source': 'Reconciliation Status'}
+
             for m in all_months:
                 m_tx = df_tx_year[df_tx_year['Month_Str'] == m]
-                cc_row[m] = round(m_tx[(m_tx['account_type'] == 'Credit Card') & (m_tx['is_payment'] == 0)]['amount'].sum(), 2)
-                ba_row[m] = round(m_tx[(m_tx['account_type'] == 'Bank Account') & (m_tx['is_payment'] == 0) & (~m_tx['category'].isin(['Bank Acc Charges', 'Internal Transfer', 'Payment']))]['amount'].sum(), 2)
-                cash_acc_row[m] = round(m_tx[(m_tx['account_type'] == 'Cash')]['amount'].sum(), 2)
+                
+                # Credit Card: Purchases only
+                cc_val = m_tx[(m_tx['account_type'] == 'Credit Card') & (m_tx['is_payment'] == 0)]['amount'].sum()
+                
+                # Bank Account: True expenses only (exclude income deposits, fee rebate wash, and CC payments)
+                ba_val = m_tx[
+                    (m_tx['account_type'] == 'Bank Account') & 
+                    (m_tx['cat_type'] != 'Income') & 
+                    (m_tx['is_payment'] == 0) & 
+                    (~m_tx['category'].isin(['Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']))
+                ]['amount'].sum()
+                
+                # Cash: Logged cash purchases from cash wallet
+                cash_val = m_tx[m_tx['account_type'] == 'Cash']['amount'].sum()
+
+                cc_row[m] = round(cc_val, 2)
+                ba_row[m] = round(ba_val, 2)
+                cash_acc_row[m] = round(cash_val, 2)
+                
+                tot_outflows = round(cc_val + ba_val + cash_val, 2)
+                outflow_sum_row[m] = tot_outflows
+                
+                # Formula: Total Spent == Credit Card + Bank Account + Cash
+                is_reconciled = abs(total_spent_row[m] - tot_outflows) < 0.05
+                recon_status_row[m] = "✅ Correct" if is_reconciled else "⚠️ Check Data"
+
             cc_row['Total'] = round(sum([cc_row[m] for m in all_months]), 2)
             ba_row['Total'] = round(sum([ba_row[m] for m in all_months]), 2)
             cash_acc_row['Total'] = round(sum([cash_acc_row[m] for m in all_months]), 2)
+            outflow_sum_row['Total'] = round(sum([outflow_sum_row[m] for m in all_months]), 2)
+            recon_status_row['Total'] = "✅ Correct" if abs(total_spent_row['Total'] - outflow_sum_row['Total']) < 0.05 else "⚠️ Check Data"
 
-            summary_rows = [total_spent_row, actual_spent_row, income_row, left_row, cc_row, ba_row, cash_acc_row]
-            df_display_year = pd.concat([grid_df, pd.DataFrame(summary_rows).set_index('Type')])
+            recon_df = pd.DataFrame([cc_row, ba_row, cash_acc_row, outflow_sum_row, recon_status_row]).set_index('Source')
+            
+            # Format numbers as currency while keeping status badges clean
+            def format_recon(val):
+                if isinstance(val, (int, float)):
+                    return f"${val:,.2f}"
+                return str(val)
 
-            check_row = {}
-            for m in all_months:
-                is_bal = abs(total_spent_row[m] - (cc_row[m] + ba_row[m] + cash_acc_row[m])) < 1.0
-                check_row[m] = "✅ Correct" if is_bal else "⚠️ Check Data"
-            check_row['Total'] = "✅ Correct"
-            check_df = pd.DataFrame([check_row], index=['Reconciliation Status'])
+            st.dataframe(recon_df.map(format_recon), use_container_width=True)
 
-            latest_m = all_months[-1]
-            st.markdown(f"### 🎯 Summary for **{latest_m}**")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Total Income", f"${income_row[latest_m]:,.2f}")
-            k2.metric("Actual Living Spent", f"${actual_spent_row[latest_m]:,.2f}")
-            k3.metric("Savings & Sent to India", f"${(grid_df.loc['Savings', latest_m] + grid_df.loc['Ria', latest_m]):,.2f}")
-            k4.metric("Left (Net Savings)", f"${left_row[latest_m]:,.2f}", delta=left_row[latest_m])
-
-            st.markdown("---")
-            st.subheader(f"📋 {selected_dash_year} Master Budget Ledger")
-            st.dataframe(df_display_year.style.format("${:,.2f}"), use_container_width=True)
-            st.dataframe(check_df, use_container_width=True)
-
+            # --- 4. CATEGORY MONTH-ON-MONTH DRILLDOWN ---
             st.markdown("---")
             st.subheader("📈 Category Month-on-Month Drilldown")
-            inspect_cat = st.selectbox("Select Category to Analyze", options=[c for c in ordered_cats if c in grid_df.index])
             
-            cat_chart_data = grid_df.loc[inspect_cat, all_months]
+            cd_col1, cd_col2 = st.columns([1.5, 1.5])
+            with cd_col1:
+                inspect_cat = st.selectbox("Select Category to Analyze", options=[c for c in ordered_cats if c in grid_df.index])
+            with cd_col2:
+                month_filter_options = ["All Months"] + all_months
+                drilldown_month = st.selectbox("🗓️ Filter Transactions by Month", options=month_filter_options, index=0)
+
             c_ch1, c_ch2 = st.columns([1.5, 1.5])
             with c_ch1:
                 st.write(f"#### {inspect_cat} Spending Trajectory")
-                st.bar_chart(cat_chart_data)
+                st.bar_chart(grid_df.loc[inspect_cat, all_months])
             with c_ch2:
-                st.write(f"#### {inspect_cat} Transactions")
-                sub_tx = df_tx_year[(df_tx_year['category'] == inspect_cat)].sort_values('date', ascending=False)
+                st.write(f"#### {inspect_cat} Transactions ({drilldown_month})")
+                sub_tx = df_tx_year[df_tx_year['category'] == inspect_cat]
+                if drilldown_month != "All Months":
+                    sub_tx = sub_tx[sub_tx['Month_Str'] == drilldown_month]
+                    
+                sub_tx = sub_tx.sort_values('date', ascending=False)
                 if not sub_tx.empty:
                     st.dataframe(
                         sub_tx[['date', 'description', 'amount', 'account_type']]
@@ -651,6 +674,8 @@ with tab_dashboard:
                         .style.format({'Amount ($)': "${:,.2f}"}),
                         use_container_width=True, hide_index=True
                     )
+                else:
+                    st.info(f"No {inspect_cat} transactions found for {drilldown_month}.")
 
 # ==========================================================
 # --- TAB 5: RULES & MASTER CATEGORIES ---
