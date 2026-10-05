@@ -57,6 +57,61 @@ def get_categories_dict(conn):
 MONTH_MAP = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
              'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
 
+def generate_excel_report(year, grid_df, summary_df, recon_df, tx_df):
+    """Builds a comprehensive multi-tab Excel workbook for download."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        grid_df.to_excel(writer, sheet_name=f'{year} Outflows')
+        summary_df.to_excel(writer, sheet_name=f'{year} Summary')
+        recon_df.to_excel(writer, sheet_name=f'{year} Reconciliation')
+        
+        tx_clean = tx_df[['date', 'description', 'amount', 'category', 'account_type']].copy()
+        tx_clean['date'] = tx_clean['date'].dt.strftime('%Y-%m-%d')
+        tx_clean.rename(columns={
+            'date': 'Date', 'description': 'Description', 'amount': 'Amount ($)',
+            'category': 'Category', 'account_type': 'Account'
+        }, inplace=True)
+        tx_clean.to_excel(writer, sheet_name=f'{year} Transactions', index=False)
+    return output.getvalue()
+
+def unlock_pdf_bytes(file_bytes, password=""):
+    """
+    Unlocks encrypted PDFs (including standard bank permission restrictions and empty passwords)
+    and returns a clean, unencrypted bytes stream so pdfminer and pypdf can parse without password errors.
+    """
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        if reader.is_encrypted:
+            decrypted = False
+            # 1. Try empty password first (standard for bank statements with viewing/copying restrictions)
+            try:
+                if reader.decrypt("") != 0:
+                    decrypted = True
+            except Exception:
+                pass
+            
+            # 2. Try user-supplied password if provided
+            if not decrypted and password:
+                try:
+                    if reader.decrypt(password) != 0:
+                        decrypted = True
+                except Exception:
+                    pass
+            
+            if not decrypted:
+                return None, "⚠️ This PDF is password-protected. Please enter your PDF password in the field above and try again."
+            
+            # Export completely unencrypted PDF into memory
+            writer = pypdf.PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            unenc_out = io.BytesIO()
+            writer.write(unenc_out)
+            return unenc_out.getvalue(), None
+    except Exception:
+        pass
+    return file_bytes, None
+
 # ==========================================================
 # --- TD STATEMENT PDF PARSERS ---
 # ==========================================================
@@ -164,12 +219,19 @@ with tab_upload:
         uploaded_file = st.file_uploader("Upload PDF, CSV, or Excel statement", type=["pdf", "csv", "xlsx", "xls"])
         account_type = st.selectbox("Select Account Type", ["Bank Account", "Credit Card"])
         statement_year = st.number_input("Statement Year", min_value=2024, max_value=2035, value=2026)
+        pdf_password = st.text_input("PDF Password (leave blank if none)", type="password", help="If your bank statement is password-protected, enter the password here.")
 
         if uploaded_file and st.button("Process & Reconcile Statement"):
             file_bytes = uploaded_file.read()
             df = pd.DataFrame()
             
             if uploaded_file.name.lower().endswith(".pdf"):
+                clean_bytes, err_msg = unlock_pdf_bytes(file_bytes, pdf_password)
+                if err_msg:
+                    st.error(err_msg)
+                    st.stop()
+                file_bytes = clean_bytes
+
                 if account_type == "Bank Account":
                     df = parse_td_chequing_pdf(file_bytes, statement_year)
                 else:
@@ -529,7 +591,7 @@ with tab_dashboard:
         if 2026 not in dash_years: dash_years.append(2026)
         dash_years = sorted(list(set(dash_years)), reverse=True)
 
-        d_col1, _ = st.columns([1.5, 3])
+        d_col1, d_col2 = st.columns([1.5, 1.5])
         with d_col1:
             selected_dash_year = st.selectbox("📅 Select Budget Year", options=dash_years, index=0)
 
@@ -539,7 +601,6 @@ with tab_dashboard:
         if not all_months:
             st.info(f"No transactions recorded for {selected_dash_year} yet.")
         else:
-            # Categories in exact order of Excel 2026 sheet
             ordered_cats = [
                 'Food', 'Utilities', 'Va-Al-SM', 'Transportation', 'Entertainment',
                 'Cell Phone', 'Clothes', 'Rent', 'Savings', 'Ria', 'Cash',
@@ -602,10 +663,8 @@ with tab_dashboard:
             for m in all_months:
                 m_tx = df_tx_year[df_tx_year['Month_Str'] == m]
                 
-                # Credit Card: Purchases only
                 cc_val = m_tx[(m_tx['account_type'] == 'Credit Card') & (m_tx['is_payment'] == 0)]['amount'].sum()
                 
-                # Bank Account: True expenses only (exclude income deposits, fee rebate wash, and CC payments)
                 ba_val = m_tx[
                     (m_tx['account_type'] == 'Bank Account') & 
                     (m_tx['cat_type'] != 'Income') & 
@@ -613,7 +672,6 @@ with tab_dashboard:
                     (~m_tx['category'].isin(['Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']))
                 ]['amount'].sum()
                 
-                # Cash: Logged cash purchases from cash wallet
                 cash_val = m_tx[m_tx['account_type'] == 'Cash']['amount'].sum()
 
                 cc_row[m] = round(cc_val, 2)
@@ -623,7 +681,6 @@ with tab_dashboard:
                 tot_outflows = round(cc_val + ba_val + cash_val, 2)
                 outflow_sum_row[m] = tot_outflows
                 
-                # Formula: Total Spent == Credit Card + Bank Account + Cash
                 is_reconciled = abs(total_spent_row[m] - tot_outflows) < 0.05
                 recon_status_row[m] = "✅ Correct" if is_reconciled else "⚠️ Check Data"
 
@@ -635,13 +692,25 @@ with tab_dashboard:
 
             recon_df = pd.DataFrame([cc_row, ba_row, cash_acc_row, outflow_sum_row, recon_status_row]).set_index('Source')
             
-            # Format numbers as currency while keeping status badges clean
             def format_recon(val):
                 if isinstance(val, (int, float)):
                     return f"${val:,.2f}"
                 return str(val)
 
             st.dataframe(recon_df.map(format_recon), use_container_width=True)
+
+            # --- EXCEL DOWNLOAD BUTTON ---
+            with d_col2:
+                st.write("")
+                st.write("")
+                excel_bytes = generate_excel_report(selected_dash_year, grid_df, summary_df, recon_df, df_tx_year)
+                st.download_button(
+                    label=f"📥 Download {selected_dash_year} Budget Report (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"{selected_dash_year}_Budget_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
 
             # --- 4. CATEGORY MONTH-ON-MONTH DRILLDOWN ---
             st.markdown("---")
