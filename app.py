@@ -42,12 +42,18 @@ with engine.connect() as conn:
         WHERE category = 'Uncategorized'
           AND (description ILIKE '%R ia%' OR description ILIKE '%Ria%');
 
+        -- Reset mislabeled 'Bank Acc Charges' that are actually general merchants back to Uncategorized
+        UPDATE transactions
+        SET category = 'Uncategorized'
+        WHERE category = 'Bank Acc Charges'
+          AND NOT (description ILIKE '%MONTHLY ACCOUNT FEE%' OR description ILIKE '%ACCT BAL REBATE%' OR description ILIKE '%FEE%');
+
         DELETE FROM custom_categories WHERE name IN ('Credit Card Bill', 'Credit Card Payment', 'Card Payment');
     """))
     conn.commit()
 
 tab_upload, tab_manage, tab_cash, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "✏️ Edit & Split Transactions", "💵 Cash Wallet", "📊 Master Budget Dashboard", "⚙️ Rules & Categories"
+    "📥 Upload Statement", "✏️️ Edit & Split Transactions", "💵 Cash Wallet", "📊 Master Budget Dashboard", "⚙️ Rules & Categories"
 ])
 
 def get_categories_dict(conn):
@@ -75,22 +81,17 @@ def generate_excel_report(year, grid_df, summary_df, recon_df, tx_df):
     return output.getvalue()
 
 def unlock_pdf_bytes(file_bytes, password=""):
-    """
-    Unlocks encrypted PDFs (including standard bank permission restrictions and empty passwords)
-    and returns a clean, unencrypted bytes stream so pdfminer and pypdf can parse without password errors.
-    """
+    """Unlocks encrypted PDFs and permission locks in memory."""
     try:
         reader = pypdf.PdfReader(io.BytesIO(file_bytes))
         if reader.is_encrypted:
             decrypted = False
-            # 1. Try empty password first (standard for bank statements with viewing/copying restrictions)
             try:
                 if reader.decrypt("") != 0:
                     decrypted = True
             except Exception:
                 pass
             
-            # 2. Try user-supplied password if provided
             if not decrypted and password:
                 try:
                     if reader.decrypt(password) != 0:
@@ -101,7 +102,6 @@ def unlock_pdf_bytes(file_bytes, password=""):
             if not decrypted:
                 return None, "⚠️ This PDF is password-protected. Please enter your PDF password in the field above and try again."
             
-            # Export completely unencrypted PDF into memory
             writer = pypdf.PdfWriter()
             for page in reader.pages:
                 writer.add_page(page)
@@ -117,6 +117,7 @@ def unlock_pdf_bytes(file_bytes, password=""):
 # ==========================================================
 
 def parse_td_chequing_pdf(file_bytes, year=2026):
+    """Accurately extracts both withdrawals and deposits, even when amounts and dates merge in PDF boxes."""
     rsrcmgr = PDFResourceManager()
     laparams = LAParams(line_margin=0.1)
     device = PDFPageAggregator(rsrcmgr, laparams=laparams)
@@ -146,10 +147,12 @@ def parse_td_chequing_pdf(file_bytes, year=2026):
             clustered[(p, y)].append((x, txt))
             
     txns = []
+    date_regex = re.compile(r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{2})', re.IGNORECASE)
+
     for (p, cy) in sorted(clustered.keys(), key=lambda k: (k[0], -k[1])):
         items = sorted(clustered[(p, cy)], key=lambda x: x[0])
         row_txt = " ".join([t for _, t in items])
-        if any(h in row_txt for h in ['START ING BALANCE', 'CLOSING BALANCE', 'Account /Transact', 'Overdraft']):
+        if any(h in row_txt for h in ['START ING BALANCE', 'CLOSING BALANCE', 'Account /Transact', 'Overdraft', 'Branch No.', 'UNLIMITED', 'Descript ion']):
             continue
             
         date_item = None
@@ -159,15 +162,19 @@ def parse_td_chequing_pdf(file_bytes, year=2026):
         
         for x, t in items:
             clean_t = t.replace(" ", "").replace(",", "").replace("$", "")
-            m_date = re.match(r'^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$', clean_t, re.IGNORECASE)
-            if m_date and 400 < x < 450:
+            
+            m_date = date_regex.search(clean_t)
+            if m_date:
                 date_item = (m_date.group(1).upper(), m_date.group(2))
-            elif 250 < x < 330:
-                m_amt = re.match(r'^-?(\d+\.\d{2})$', clean_t)
-                if m_amt: withdrawal = float(m_amt.group(1))
-            elif 340 < x < 400:
-                m_amt = re.match(r'^-?(\d+\.\d{2})$', clean_t)
-                if m_amt: deposit = float(m_amt.group(1))
+                clean_t = clean_t[:m_date.start()] + clean_t[m_date.end():]
+                
+            m_amt = re.search(r'^-?(\d+\.\d{2})', clean_t)
+            if m_amt:
+                amt_val = float(m_amt.group(1))
+                if 250 <= x < 340:
+                    withdrawal = amt_val
+                elif 340 <= x < 420:
+                    deposit = amt_val
             elif x < 250:
                 desc_parts.append(t)
                 
@@ -175,6 +182,14 @@ def parse_td_chequing_pdf(file_bytes, year=2026):
             m_str, d_str = date_item
             iso_date = f"{year}-{MONTH_MAP[m_str]}-{d_str}"
             desc = " ".join(desc_parts).replace("_", " ").strip()
+            
+            desc_tokens = desc.split()
+            cleaned_tokens = []
+            for tok in desc_tokens:
+                if not cleaned_tokens or tok != cleaned_tokens[-1]:
+                    cleaned_tokens.append(tok)
+            desc = " ".join(cleaned_tokens)
+            
             amt = withdrawal if withdrawal is not None else deposit
             is_dep = deposit is not None
             txns.append({
@@ -387,7 +402,7 @@ with tab_upload:
 # --- TAB 2: EDIT & SPLIT TRANSACTIONS (DYNAMIC FILTERS) ---
 # ==========================================================
 with tab_manage:
-    st.subheader("✏️ Review, Edit Categories & Split Bills")
+    st.subheader("✏️️ Review, Edit Categories & Split Bills")
     
     with engine.connect() as conn:
         all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions ORDER BY date DESC", conn)
@@ -395,6 +410,7 @@ with tab_manage:
         
         existing_cats = set(cat_map.keys()).union(set(all_tx['category'].dropna().unique()))
         assignable_cats = sorted([c for c in existing_cats if c != 'Uncategorized'])
+        dropdown_cats = ['Uncategorized'] + assignable_cats
 
     if all_tx.empty:
         st.info("No transactions in database yet. Upload a statement first!")
@@ -403,8 +419,8 @@ with tab_manage:
         all_tx['Year'] = all_tx['date'].dt.year
         all_tx['Month_Str'] = all_tx['date'].dt.strftime("%b'%y")
 
-        # --- 5-Column Filter Bar ---
-        f_yr, f_mo, f_status, f_cat, f_search = st.columns([1.1, 1.2, 1.6, 1.4, 1.8])
+        # --- 6-Column Filter Bar ---
+        f_yr, f_mo, f_acc, f_status, f_cat, f_search = st.columns([1.0, 1.1, 1.3, 1.5, 1.3, 1.8])
 
         avail_years = sorted(all_tx['Year'].unique(), reverse=True)
         year_options = ["All Years"] + [str(y) for y in avail_years]
@@ -421,11 +437,16 @@ with tab_manage:
         with f_mo:
             selected_mo = st.selectbox("🗓️ Month", options=month_options, index=0)
 
+        with f_acc:
+            selected_acc = st.selectbox("🏦 Account", options=["All Accounts", "Credit Card", "Bank Account", "Cash"], index=0)
+
         slice_df = all_tx.copy()
         if selected_yr != "All Years":
             slice_df = slice_df[slice_df['Year'] == int(selected_yr)]
         if selected_mo != "All Months":
             slice_df = slice_df[slice_df['Month_Str'] == selected_mo]
+        if selected_acc != "All Accounts":
+            slice_df = slice_df[slice_df['account_type'] == selected_acc]
 
         uncat_n = len(slice_df[slice_df['category'] == 'Uncategorized'])
         cat_n = len(slice_df[slice_df['category'] != 'Uncategorized'])
@@ -441,18 +462,20 @@ with tab_manage:
         with f_cat:
             selected_cat_filter = st.selectbox(
                 "📂 Category",
-                options=["All Categories"] + assignable_cats,
+                options=["All Categories"] + dropdown_cats,
                 index=0
             )
 
         with f_search:
-            search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Tim, Uber...")
+            search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Costco, Phoenix...")
 
         df_view = all_tx.copy()
         if selected_yr != "All Years":
             df_view = df_view[df_view['Year'] == int(selected_yr)]
         if selected_mo != "All Months":
             df_view = df_view[df_view['Month_Str'] == selected_mo]
+        if selected_acc != "All Accounts":
+            df_view = df_view[df_view['account_type'] == selected_acc]
         if "Uncategorized" in status_view:
             df_view = df_view[df_view['category'] == 'Uncategorized']
         elif "Categorized" in status_view:
@@ -475,46 +498,96 @@ with tab_manage:
             
             with c_left:
                 with st.expander(f"📌 {row['date'].strftime('%Y-%m-%d')} | **{row['description']}** | {amt_display} ({row['account_type']})"):
-                    st.markdown("#### ✂️ Split this bill with friends")
+                    st.markdown("#### ✂️ Split Transaction Options")
+                    split_mode = st.radio(
+                        "Choose Split Type",
+                        ["🛒 Split into Multiple Categories (e.g. Costco: Clothes + Food)", "👥 Split with Friends (Shared Bill)"],
+                        key=f"sm_{row['id']}"
+                    )
+                    
                     full_amt = float(abs(row['amount']))
-                    my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
-                    fr_share = round(full_amt - my_share, 2)
-                    st.info(f"Friends Owe You: **${fr_share:.2f}** (Marked as `Shared Reimbursement` — will not count toward your living expenses).")
                     
-                    split_cat = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"sp_cat_{row['id']}")
-                    
-                    if st.button("Confirm & Split Bill", key=f"btn_sp_{row['id']}"):
-                        with engine.connect() as conn:
-                            conn.execute(text("UPDATE transactions SET amount = :a, category = :c, description = :d WHERE id = :id"), {
-                                "a": my_share, "c": split_cat, "d": f"{row['description']} (My Share)", "id": row['id']
-                            })
-                            conn.execute(text("INSERT INTO transactions (date, description, amount, category, account_type, is_payment) VALUES (:d, :desc, :a, 'Shared Reimbursement', :acc, 0)"), {
-                                "d": row['date'], "desc": f"{row['description']} (Friends Share)", "a": fr_share, "acc": row['account_type']
-                            })
-                            conn.commit()
-                        st.success("Bill split successfully!")
-                        st.rerun()
+                    if "Split into Multiple Categories" in split_mode:
+                        st.write("##### Itemize into 2 Categories")
+                        sp_c1, sp_c2 = st.columns(2)
+                        with sp_c1:
+                            part1_amt = st.number_input("Part 1 Amount ($)", min_value=0.01, max_value=full_amt - 0.01, value=round(full_amt/2, 2), step=1.0, key=f"p1_amt_{row['id']}")
+                            part1_cat = st.selectbox("Part 1 Category", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"p1_cat_{row['id']}")
+                        with sp_c2:
+                            part2_amt = round(full_amt - part1_amt, 2)
+                            st.metric("Part 2 Amount ($)", f"${part2_amt:.2f}")
+                            part2_cat = st.selectbox("Part 2 Category", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"p2_cat_{row['id']}")
+                        
+                        st.info(f"Will create: **${part1_amt:.2f}** ({part1_cat}) and **${part2_amt:.2f}** ({part2_cat}). Both remain under your budget.")
+                        if st.button("Confirm Category Split", key=f"btn_catsplit_{row['id']}"):
+                            with engine.connect() as conn:
+                                conn.execute(text("UPDATE transactions SET amount = :a, category = :c, description = :d WHERE id = :id"), {
+                                    "a": part1_amt, "c": part1_cat, "d": f"{row['description']} (Part 1 - {part1_cat})", "id": row['id']
+                                })
+                                conn.execute(text("INSERT INTO transactions (date, description, amount, category, account_type, is_payment) VALUES (:d, :desc, :a, :c, :acc, 0)"), {
+                                    "d": row['date'], "desc": f"{row['description']} (Part 2 - {part2_cat})", "a": part2_amt, "c": part2_cat, "acc": row['account_type']
+                                })
+                                conn.commit()
+                            st.success("Split into 2 categories successfully!")
+                            st.rerun()
+                    else:
+                        st.write("##### Split with Friends")
+                        my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
+                        fr_share = round(full_amt - my_share, 2)
+                        st.info(f"Friends Owe You: **${fr_share:.2f}** (Marked as `Shared Reimbursement` — will not count toward your living expenses).")
+                        
+                        split_cat = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"sp_cat_{row['id']}")
+                        
+                        if st.button("Confirm Friend Split", key=f"btn_sp_{row['id']}"):
+                            with engine.connect() as conn:
+                                conn.execute(text("UPDATE transactions SET amount = :a, category = :c, description = :d WHERE id = :id"), {
+                                    "a": my_share, "c": split_cat, "d": f"{row['description']} (My Share)", "id": row['id']
+                                })
+                                conn.execute(text("INSERT INTO transactions (date, description, amount, category, account_type, is_payment) VALUES (:d, :desc, :a, 'Shared Reimbursement', :acc, 0)"), {
+                                    "d": row['date'], "desc": f"{row['description']} (Friends Share)", "a": fr_share, "acc": row['account_type']
+                                })
+                                conn.commit()
+                            st.success("Bill split with friends successfully!")
+                            st.rerun()
+
+            # Dynamic Category display and Edit/Save behavior
+            edit_key = f"edit_active_{row['id']}"
+            is_editing = st.session_state.get(edit_key, False)
+            is_uncat = row['category'] == 'Uncategorized'
 
             with c_cat:
-                cur_idx = assignable_cats.index(row['category']) if row['category'] in assignable_cats else 0
-                new_selected_cat = st.selectbox(
-                    "Category", 
-                    assignable_cats, 
-                    index=cur_idx, 
-                    key=f"cat_sel_{row['id']}", 
-                    label_visibility="collapsed"
-                )
+                if is_uncat or is_editing:
+                    cur_cat = row['category'] if row['category'] in dropdown_cats else 'Uncategorized'
+                    cur_idx = dropdown_cats.index(cur_cat)
+                    new_selected_cat = st.selectbox(
+                        "Category", 
+                        dropdown_cats, 
+                        index=cur_idx, 
+                        key=f"cat_sel_{row['id']}", 
+                        label_visibility="collapsed"
+                    )
+                else:
+                    st.markdown(f"**`{row['category']}`**")
 
             with c_btn:
-                if st.button("Save", key=f"btn_save_{row['id']}"):
-                    is_pay = 1 if new_selected_cat == 'Payment' else 0
-                    with engine.connect() as conn:
-                        conn.execute(text("UPDATE transactions SET category = :cat, is_payment = :pay WHERE id = :id"), {
-                            "cat": new_selected_cat, "pay": is_pay, "id": row['id']
-                        })
-                        conn.commit()
-                    st.success("Saved!")
-                    st.rerun()
+                if is_uncat or is_editing:
+                    if st.button("Save", key=f"btn_save_{row['id']}"):
+                        if new_selected_cat != 'Uncategorized':
+                            is_pay = 1 if new_selected_cat == 'Payment' else 0
+                            with engine.connect() as conn:
+                                conn.execute(text("UPDATE transactions SET category = :cat, is_payment = :pay WHERE id = :id"), {
+                                    "cat": new_selected_cat, "pay": is_pay, "id": row['id']
+                                })
+                                conn.commit()
+                            st.session_state[edit_key] = False
+                            st.success("Saved!")
+                            st.rerun()
+                        else:
+                            st.warning("Please choose a category before saving.")
+                else:
+                    if st.button("Edit", key=f"btn_edit_{row['id']}"):
+                        st.session_state[edit_key] = True
+                        st.rerun()
 
 # ==========================================================
 # --- TAB 3: CASH WALLET LEDGER ---
