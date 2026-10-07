@@ -1,0 +1,53 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # Runs twice a day: 04:00 UTC and 16:00 UTC
+    - cron: '0 4,16 * * *'
+  workflow_dispatch:
+
+jobs:
+  wake-streamlit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright & Chromium
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Visit App and Wake
+        env:
+          APP_URL: "https://expense-tracker-znpegex2vsjntb7wmwtbht.streamlit.app/"
+        run: |
+          python -c "
+          import os, time
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ.get('APP_URL')
+          print(f'Checking status of: {url}')
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+              page = context.new_page()
+
+              page.goto(url, wait_until='domcontentloaded', timeout=60000)
+              time.sleep(6)
+
+              wake_button = page.locator('button:has-text(\"Yes, get this app back up!\")')
+
+              if wake_button.count() > 0 and wake_button.first.is_visible():
+                  print('App was asleep. Clicking wake-up button...')
+                  wake_button.first.click()
+                  time.sleep(30)
+                  print('Wake-up command delivered successfully.')
+              else:
+                  print('App is already awake! Active session registered.')
+
+              browser.close()
+          "
