@@ -1,0 +1,32 @@
+name: Keep Supabase Alive
+
+on:
+  schedule:
+    # Runs at 12:00 UTC every Tuesday and Friday
+    - cron: '0 12 * * 2,5'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Python & psycopg
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install Database Driver
+        run: pip install psycopg[binary] sqlalchemy
+      - name: Ping Supabase Database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -c "
+          from sqlalchemy import create_engine, text
+          import os
+          db_url = os.environ.get('DATABASE_URL')
+          if db_url:
+              engine = create_engine(db_url)
+              with engine.connect() as conn:
+                  res = conn.execute(text('SELECT COUNT(*) FROM custom_categories;')).scalar()
+                  print(f'Supabase ping successful! Found {res} categories.')
+          "
