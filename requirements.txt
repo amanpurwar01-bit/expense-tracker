@@ -7,3 +7,4 @@ openpyxl
 pypdf
 pdfminer.six
 pdfplumber
+pymupdf
