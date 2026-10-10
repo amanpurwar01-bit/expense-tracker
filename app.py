@@ -24,8 +24,11 @@ st.title("💳 Personal Finance & Master Reconciliation Hub")
 # Auto-cleanup database on startup
 with engine.connect() as conn:
     conn.execute(text("""
-        INSERT INTO custom_categories (name, cat_type) VALUES ('Payment', 'Wash/Transfer')
-        ON CONFLICT (name) DO UPDATE SET cat_type = 'Wash/Transfer';
+        INSERT INTO custom_categories (name, cat_type) VALUES 
+            ('Payment', 'Wash/Transfer'),
+            ('TFSA', 'Expense'),
+            ('FHSA', 'Expense')
+        ON CONFLICT (name) DO NOTHING;
 
         -- Fix any credit card payments that were mislabeled as Bank Acc Charges
         UPDATE transactions 
@@ -53,7 +56,7 @@ with engine.connect() as conn:
     conn.commit()
 
 tab_upload, tab_manage, tab_cash, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "✏️️ Edit & Split Transactions", "💵 Cash Wallet", "📊 Master Budget Dashboard", "⚙️ Rules & Categories"
+    "📥 Upload Statement", "✏️ Edit & Split Transactions", "💵 Cash Wallet", "📊 Master Budget Dashboard", "⚙️ Rules & Categories"
 ])
 
 def get_categories_dict(conn):
@@ -63,11 +66,12 @@ def get_categories_dict(conn):
 MONTH_MAP = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
              'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
 
-def generate_excel_report(year, grid_df, summary_df, recon_df, tx_df):
+def generate_excel_report(year, grid_df, savings_df, summary_df, recon_df, tx_df):
     """Builds a comprehensive multi-tab Excel workbook for download."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         grid_df.to_excel(writer, sheet_name=f'{year} Outflows')
+        savings_df.to_excel(writer, sheet_name=f'{year} Savings & Investments')
         summary_df.to_excel(writer, sheet_name=f'{year} Summary')
         recon_df.to_excel(writer, sheet_name=f'{year} Reconciliation')
         
@@ -402,7 +406,7 @@ with tab_upload:
 # --- TAB 2: EDIT & SPLIT TRANSACTIONS (DYNAMIC FILTERS) ---
 # ==========================================================
 with tab_manage:
-    st.subheader("✏️️ Review, Edit Categories & Split Bills")
+    st.subheader("✏️ Review, Edit Categories & Split Bills")
     
     with engine.connect() as conn:
         all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions ORDER BY date DESC", conn)
@@ -511,7 +515,7 @@ with tab_manage:
                         st.write("##### Itemize into 2 Categories")
                         sp_c1, sp_c2 = st.columns(2)
                         with sp_c1:
-                            part1_amt = st.number_input("Part 1 Amount ($)", min_value=0.01, max_value=full_amt - 0.01, value=round(full_amt/2, 2), step=1.0, key=f"p1_amt_{row['id']}")
+                            part1_amt = st.number_input("Part 1 Amount ($)", min_value=0.01, max_value=max(full_amt - 0.01, 0.02), value=round(full_amt/2, 2), step=1.0, key=f"p1_amt_{row['id']}")
                             part1_cat = st.selectbox("Part 1 Category", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"p1_cat_{row['id']}")
                         with sp_c2:
                             part2_amt = round(full_amt - part1_amt, 2)
@@ -680,52 +684,119 @@ with tab_dashboard:
                 'Citizenship', 'India', 'Misc', 'Health'
             ]
             
+            # Combine preset categories with any custom expense categories in the database
+            all_known_cats = [c for c in ordered_cats] + [
+                c for c in df_tx_year['category'].unique() 
+                if c not in ordered_cats 
+                and c not in ['Uncategorized', 'Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
+                and cat_map.get(c) == 'Expense'
+            ]
+            seen_c = set()
+            cats_to_evaluate = [c for c in all_known_cats if not (c in seen_c or seen_c.add(c))]
+
             # --- 1. TABLE 1: MASTER CATEGORY OUTFLOWS ---
-            st.subheader(f"📋 1. {selected_dash_year} Master Category Outflows")
+            t1_head, t1_ctrl = st.columns([2.2, 1.3])
+            with t1_head:
+                st.subheader(f"📋 1. {selected_dash_year} Master Category Outflows")
+            with t1_ctrl:
+                sort_highest = st.checkbox("⬇️ Sort categories from highest to lowest spend", value=False)
+
             pivot_data = []
-            for cat in ordered_cats:
+            for cat in cats_to_evaluate:
                 cat_rows = df_tx_year[df_tx_year['category'] == cat]
                 row_dict = {'Type': cat}
                 for m in all_months:
                     val = cat_rows[cat_rows['Month_Str'] == m]['amount'].sum()
                     row_dict[m] = round(val, 2)
-                row_dict['Total'] = round(sum([row_dict[m] for m in all_months]), 2)
-                pivot_data.append(row_dict)
+                row_total = round(sum([row_dict[m] for m in all_months]), 2)
+                row_dict['Total'] = row_total
+                
+                # Rule 1: Exclude categories where total spending is 0
+                if row_total > 0:
+                    pivot_data.append(row_dict)
 
-            grid_df = pd.DataFrame(pivot_data).set_index('Type')
+            # Rule 2: Sort descending if requested
+            if sort_highest:
+                pivot_data = sorted(pivot_data, key=lambda x: x['Total'], reverse=True)
+
+            # Rule 3: Bottom Total Row pinned at the bottom
+            total_outflows_row = {'Type': 'Total'}
+            for m in all_months:
+                total_outflows_row[m] = round(sum(r[m] for r in pivot_data), 2)
+            total_outflows_row['Total'] = round(sum(r['Total'] for r in pivot_data), 2)
+
+            display_table_1 = pivot_data + [total_outflows_row]
+            grid_df = pd.DataFrame(display_table_1).set_index('Type')
             st.dataframe(grid_df.style.format("${:,.2f}"), use_container_width=True)
 
-            # --- 2. TABLE 2: MONTHLY FINANCIAL SUMMARY ---
-            st.subheader("💵 2. Monthly Financial Summary")
+            # --- 2. TABLE 2: INVESTMENTS, SAVINGS & REMITTANCES BREAKDOWN ---
+            st.subheader("💰 2. Investments, Savings & Remittances Breakdown")
             
+            def classify_savings(row):
+                desc = str(row['description']).upper().replace(" ", "")
+                cat = str(row['category']).upper().replace(" ", "")
+                if 'FHSA' in cat or 'FHSA' in desc:
+                    return 'FHSA'
+                elif 'TFSA' in cat or 'TFSA' in desc or 'TFS' in desc:
+                    return 'TFSA'
+                elif any(k in cat or k in desc for k in ['RIA', 'INDIA', 'REMITTANCE']):
+                    return 'Sent to India (Ria)'
+                elif 'SAVING' in cat or 'INV' in desc or 'INVEST' in cat:
+                    return 'Other Savings / Investments'
+                return None
+
+            df_tx_year['savings_goal'] = df_tx_year.apply(classify_savings, axis=1)
+
+            savings_assets = ['TFSA', 'FHSA', 'Sent to India (Ria)', 'Other Savings / Investments']
+            savings_pivot = []
+            for asset in savings_assets:
+                sub_rows = df_tx_year[df_tx_year['savings_goal'] == asset]
+                s_dict = {'Asset / Goal': asset}
+                for m in all_months:
+                    s_dict[m] = round(sub_rows[sub_rows['Month_Str'] == m]['amount'].sum(), 2)
+                s_dict['Total'] = round(sum([s_dict[m] for m in all_months]), 2)
+                savings_pivot.append(s_dict)
+
+            total_savings_row = {'Asset / Goal': 'Total Saved & Invested'}
+            for m in all_months:
+                total_savings_row[m] = round(sum(r[m] for r in savings_pivot), 2)
+            total_savings_row['Total'] = round(sum(r['Total'] for r in savings_pivot), 2)
+
+            display_savings = savings_pivot + [total_savings_row]
+            savings_df = pd.DataFrame(display_savings).set_index('Asset / Goal')
+            st.dataframe(savings_df.style.format("${:,.2f}"), use_container_width=True)
+
+            # --- 3. TABLE 3: MONTHLY FINANCIAL SUMMARY ---
+            st.subheader("💵 3. Monthly Financial Summary")
+            
+            income_row = {'Metric': 'Total Income'}
             total_spent_row = {'Metric': 'Total Spent'}
             actual_spent_row = {'Metric': 'Actual Spent (Excl. Savings & Ria)'}
-            income_row = {'Metric': 'Total Income'}
             left_row = {'Metric': 'Net Left (Savings Balance)'}
 
             df_inc = df_tx_year[df_tx_year['cat_type'] == 'Income']
 
             for m in all_months:
-                tot = grid_df[m].sum()
-                sav = grid_df.loc['Savings', m] if 'Savings' in grid_df.index else 0.0
-                ria = grid_df.loc['Ria', m] if 'Ria' in grid_df.index else 0.0
+                tot = total_outflows_row[m]
+                sav_ria = total_savings_row[m]
                 inc = df_inc[df_inc['Month_Str'] == m]['amount'].sum()
 
-                total_spent_row[m] = round(tot, 2)
-                actual_spent_row[m] = round(tot - (sav + ria), 2)
                 income_row[m] = round(inc, 2)
+                total_spent_row[m] = round(tot, 2)
+                actual_spent_row[m] = round(tot - sav_ria, 2)
                 left_row[m] = round(inc - tot, 2)
 
+            income_row['Total'] = round(sum([income_row[m] for m in all_months]), 2)
             total_spent_row['Total'] = round(sum([total_spent_row[m] for m in all_months]), 2)
             actual_spent_row['Total'] = round(sum([actual_spent_row[m] for m in all_months]), 2)
-            income_row['Total'] = round(sum([income_row[m] for m in all_months]), 2)
             left_row['Total'] = round(income_row['Total'] - total_spent_row['Total'], 2)
 
-            summary_df = pd.DataFrame([total_spent_row, actual_spent_row, income_row, left_row]).set_index('Metric')
+            # Reordered as requested: Total Income -> Total Spent -> Actual Spent -> Net Left
+            summary_df = pd.DataFrame([income_row, total_spent_row, actual_spent_row, left_row]).set_index('Metric')
             st.dataframe(summary_df.style.format("${:,.2f}"), use_container_width=True)
 
-            # --- 3. TABLE 3: PAYMENT SOURCES & RECONCILIATION AUDIT ---
-            st.subheader("⚖️ 3. Payment Sources & Reconciliation Audit")
+            # --- 4. TABLE 4: PAYMENT SOURCES & RECONCILIATION AUDIT ---
+            st.subheader("⚖️ 4. Payment Sources & Reconciliation Audit")
             
             cc_row = {'Source': 'Credit Card'}
             ba_row = {'Source': 'Bank Account'}
@@ -776,7 +847,7 @@ with tab_dashboard:
             with d_col2:
                 st.write("")
                 st.write("")
-                excel_bytes = generate_excel_report(selected_dash_year, grid_df, summary_df, recon_df, df_tx_year)
+                excel_bytes = generate_excel_report(selected_dash_year, grid_df, savings_df, summary_df, recon_df, df_tx_year)
                 st.download_button(
                     label=f"📥 Download {selected_dash_year} Budget Report (.xlsx)",
                     data=excel_bytes,
@@ -785,13 +856,14 @@ with tab_dashboard:
                     use_container_width=True
                 )
 
-            # --- 4. CATEGORY MONTH-ON-MONTH DRILLDOWN ---
+            # --- 5. CATEGORY MONTH-ON-MONTH DRILLDOWN ---
             st.markdown("---")
             st.subheader("📈 Category Month-on-Month Drilldown")
             
             cd_col1, cd_col2 = st.columns([1.5, 1.5])
             with cd_col1:
-                inspect_cat = st.selectbox("Select Category to Analyze", options=[c for c in ordered_cats if c in grid_df.index])
+                selectable_drill_cats = [c for c in grid_df.index if c != 'Total']
+                inspect_cat = st.selectbox("Select Category to Analyze", options=selectable_drill_cats)
             with cd_col2:
                 month_filter_options = ["All Months"] + all_months
                 drilldown_month = st.selectbox("🗓️ Filter Transactions by Month", options=month_filter_options, index=0)
