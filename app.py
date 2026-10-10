@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import io
 import base64
@@ -618,9 +619,66 @@ with tab_audit:
                 st.markdown(f"#### 📑 Statement Document: `{fname}`")
                 st.download_button("📥 Download This PDF", bytes(p_bytes), fname, "application/pdf")
                 
-                b64_pdf = base64.b64encode(bytes(p_bytes)).decode('utf-8')
-                pdf_embed_html = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="820" type="application/pdf" style="border: 1px solid #444; border-radius: 8px;"></iframe>'
-                st.markdown(pdf_embed_html, unsafe_allow_html=True)
+                # Render using PyMuPDF if available, otherwise fallback to HTML5 canvas
+                rendered = False
+                try:
+                    import fitz  # PyMuPDF
+                    doc = fitz.open(stream=bytes(p_bytes), filetype="pdf")
+                    for pno in range(len(doc)):
+                        page = doc[pno]
+                        pix = page.get_pixmap(dpi=150)
+                        st.image(pix.tobytes("png"), caption=f"Page {pno + 1}", use_container_width=True)
+                    rendered = True
+                except ImportError:
+                    rendered = False
+
+                if not rendered:
+                    b64_pdf = base64.b64encode(bytes(p_bytes)).decode('utf-8')
+                    pdf_html = f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                      <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+                      <style>
+                        body {{ margin: 0; background-color: #0e1117; font-family: sans-serif; }}
+                        #container {{ display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 10px; }}
+                        canvas {{ width: 100% !important; height: auto !important; border-radius: 6px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }}
+                      </style>
+                    </head>
+                    <body>
+                      <div id="container"></div>
+                      <script>
+                        const pdfData = atob("{b64_pdf}");
+                        const uint8Array = new Uint8Array(pdfData.length);
+                        for (let i = 0; i < pdfData.length; i++) {{
+                          uint8Array[i] = pdfData.charCodeAt(i);
+                        }}
+                        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                        pdfjsLib.getDocument({{data: uint8Array}}).promise.then(function(pdf) {{
+                          const container = document.getElementById('container');
+                          for (let i = 1; i <= pdf.numPages; i++) {{
+                            const canvas = document.createElement('canvas');
+                            canvas.id = 'page-' + i;
+                            container.appendChild(canvas);
+                          }}
+                          for (let i = 1; i <= pdf.numPages; i++) {{
+                            pdf.getPage(i).then(function(page) {{
+                              const viewport = page.getViewport({{ scale: 1.5 }});
+                              const canvas = document.getElementById('page-' + i);
+                              const context = canvas.getContext('2d');
+                              canvas.height = viewport.height;
+                              canvas.width = viewport.width;
+                              page.render({{ canvasContext: context, viewport: viewport }});
+                            }});
+                          }}
+                        }}).catch(function(err) {{
+                          document.body.innerHTML = '<p style="color:red;padding:20px;">Could not render PDF: ' + err.message + '</p>';
+                        }});
+                      </script>
+                    </body>
+                    </html>
+                    """
+                    components.html(pdf_html, height=850, scrolling=True)
 
             with col_data:
                 st.markdown(f"#### 🔍 Extracted Data in App ({s_period})")
