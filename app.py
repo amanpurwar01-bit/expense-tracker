@@ -1,17 +1,14 @@
 import streamlit as st
 import pandas as pd
-import re
 import io
+import base64
 from datetime import datetime
-from collections import defaultdict
 from sqlalchemy import create_engine, text
-import pypdf
-from pdfminer.layout import LAParams, LTTextBox
-from pdfminer.pdfpage import PDFPage
-from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
-from pdfminer.converter import PDFPageAggregator
 
-# Database Engine Configuration
+# Import the parsing engines from our modular parsers.py
+from parsers import parse_td_chequing_pdf, parse_td_visa_pdf, unlock_pdf_bytes
+
+# Database Configuration
 engine = create_engine(
     st.secrets["DATABASE_URL"],
     pool_pre_ping=True,
@@ -21,16 +18,27 @@ engine = create_engine(
 st.set_page_config(page_title="Personal Finance Hub", layout="wide", page_icon="💳")
 st.title("💳 Personal Finance & Master Reconciliation Hub")
 
-# Auto-cleanup database on startup
+# Auto-setup tables and perform database integrity fixes
 with engine.connect() as conn:
     conn.execute(text("""
+        -- Dedicated table for saving original PDF statements
+        CREATE TABLE IF NOT EXISTS statement_files (
+            id SERIAL PRIMARY KEY,
+            filename TEXT,
+            account_type TEXT,
+            statement_year INT,
+            period_label TEXT,
+            pdf_data BYTEA,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (account_type, statement_year, period_label)
+        );
+
         INSERT INTO custom_categories (name, cat_type) VALUES 
             ('Payment', 'Wash/Transfer'),
             ('TFSA', 'Expense'),
             ('FHSA', 'Expense')
         ON CONFLICT (name) DO NOTHING;
 
-        -- Fix any credit card payments that were mislabeled as Bank Acc Charges
         UPDATE transactions 
         SET category = 'Payment', is_payment = 1 
         WHERE (description ILIKE '%TD VISA%' 
@@ -39,13 +47,11 @@ with engine.connect() as conn:
            OR description ILIKE '%CREDIT CARD BILL%'
            OR category IN ('Card Payment', 'Credit Card Bill', 'Credit Card Payment'));
 
-        -- Auto-fix any Ria transfers that were misfiled due to spaces
         UPDATE transactions
         SET category = 'Ria'
         WHERE category = 'Uncategorized'
           AND (description ILIKE '%R ia%' OR description ILIKE '%Ria%');
 
-        -- Reset mislabeled 'Bank Acc Charges' that are actually general merchants back to Uncategorized
         UPDATE transactions
         SET category = 'Uncategorized'
         WHERE category = 'Bank Acc Charges'
@@ -55,19 +61,16 @@ with engine.connect() as conn:
     """))
     conn.commit()
 
-tab_upload, tab_manage, tab_cash, tab_dashboard, tab_rules = st.tabs([
-    "📥 Upload Statement", "✏️ Edit & Split Transactions", "💵 Cash Wallet", "📊 Master Budget Dashboard", "⚙️ Rules & Categories"
+tab_upload, tab_manage, tab_cash, tab_dashboard, tab_audit, tab_rules = st.tabs([
+    "📥 Upload Statement", "✏️ Edit & Split Transactions", "💵 Cash Wallet", 
+    "📊 Master Budget Dashboard", "📄 PDF Statement Audit", "⚙️ Rules & Categories"
 ])
 
 def get_categories_dict(conn):
     rows = conn.execute(text("SELECT name, cat_type FROM custom_categories ORDER BY name")).fetchall()
     return {r[0]: r[1] for r in rows}
 
-MONTH_MAP = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
-             'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
-
 def generate_excel_report(year, grid_df, savings_df, summary_df, recon_df, tx_df):
-    """Builds a comprehensive multi-tab Excel workbook for download."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         grid_df.to_excel(writer, sheet_name=f'{year} Outflows')
@@ -84,151 +87,8 @@ def generate_excel_report(year, grid_df, savings_df, summary_df, recon_df, tx_df
         tx_clean.to_excel(writer, sheet_name=f'{year} Transactions', index=False)
     return output.getvalue()
 
-def unlock_pdf_bytes(file_bytes, password=""):
-    """Unlocks encrypted PDFs and permission locks in memory."""
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-        if reader.is_encrypted:
-            decrypted = False
-            try:
-                if reader.decrypt("") != 0:
-                    decrypted = True
-            except Exception:
-                pass
-            
-            if not decrypted and password:
-                try:
-                    if reader.decrypt(password) != 0:
-                        decrypted = True
-                except Exception:
-                    pass
-            
-            if not decrypted:
-                return None, "⚠️ This PDF is password-protected. Please enter your PDF password in the field above and try again."
-            
-            writer = pypdf.PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
-            unenc_out = io.BytesIO()
-            writer.write(unenc_out)
-            return unenc_out.getvalue(), None
-    except Exception:
-        pass
-    return file_bytes, None
-
 # ==========================================================
-# --- TD STATEMENT PDF PARSERS ---
-# ==========================================================
-
-def parse_td_chequing_pdf(file_bytes, year=2026):
-    """Accurately extracts both withdrawals and deposits, even when amounts and dates merge in PDF boxes."""
-    rsrcmgr = PDFResourceManager()
-    laparams = LAParams(line_margin=0.1)
-    device = PDFPageAggregator(rsrcmgr, laparams=laparams)
-    interpreter = PDFPageInterpreter(rsrcmgr, device)
-    
-    words = []
-    fp = io.BytesIO(file_bytes)
-    for page_idx, page in enumerate(PDFPage.get_pages(fp)):
-        interpreter.process_page(page)
-        layout = device.get_result()
-        for element in layout:
-            if isinstance(element, LTTextBox):
-                for text_line in element:
-                    txt = text_line.get_text().strip()
-                    if txt:
-                        words.append((page_idx, text_line.bbox[1], text_line.bbox[0], txt))
-                        
-    clustered = defaultdict(list)
-    for p, y, x, txt in sorted(words, key=lambda item: (item[0], -item[1], item[2])):
-        found = False
-        for (cp, cy) in clustered:
-            if cp == p and abs(cy - y) <= 4.0:
-                clustered[(cp, cy)].append((x, txt))
-                found = True
-                break
-        if not found:
-            clustered[(p, y)].append((x, txt))
-            
-    txns = []
-    date_regex = re.compile(r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{2})', re.IGNORECASE)
-
-    for (p, cy) in sorted(clustered.keys(), key=lambda k: (k[0], -k[1])):
-        items = sorted(clustered[(p, cy)], key=lambda x: x[0])
-        row_txt = " ".join([t for _, t in items])
-        if any(h in row_txt for h in ['START ING BALANCE', 'CLOSING BALANCE', 'Account /Transact', 'Overdraft', 'Branch No.', 'UNLIMITED', 'Descript ion']):
-            continue
-            
-        date_item = None
-        desc_parts = []
-        withdrawal = None
-        deposit = None
-        
-        for x, t in items:
-            clean_t = t.replace(" ", "").replace(",", "").replace("$", "")
-            
-            m_date = date_regex.search(clean_t)
-            if m_date:
-                date_item = (m_date.group(1).upper(), m_date.group(2))
-                clean_t = clean_t[:m_date.start()] + clean_t[m_date.end():]
-                
-            m_amt = re.search(r'^-?(\d+\.\d{2})', clean_t)
-            if m_amt:
-                amt_val = float(m_amt.group(1))
-                if 250 <= x < 340:
-                    withdrawal = amt_val
-                elif 340 <= x < 420:
-                    deposit = amt_val
-            elif x < 250:
-                desc_parts.append(t)
-                
-        if date_item and (withdrawal is not None or deposit is not None):
-            m_str, d_str = date_item
-            iso_date = f"{year}-{MONTH_MAP[m_str]}-{d_str}"
-            desc = " ".join(desc_parts).replace("_", " ").strip()
-            
-            desc_tokens = desc.split()
-            cleaned_tokens = []
-            for tok in desc_tokens:
-                if not cleaned_tokens or tok != cleaned_tokens[-1]:
-                    cleaned_tokens.append(tok)
-            desc = " ".join(cleaned_tokens)
-            
-            amt = withdrawal if withdrawal is not None else deposit
-            is_dep = deposit is not None
-            txns.append({
-                "Date": iso_date,
-                "Description": desc,
-                "Amount": amt,
-                "is_deposit": is_dep
-            })
-    return pd.DataFrame(txns)
-
-def parse_td_visa_pdf(file_bytes, year=2026):
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-    date_re = re.compile(
-        r'^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\s+(-?\$?[\d,]+\.\d{2})(.*)$',
-        re.IGNORECASE
-    )
-    txns = []
-    for page in reader.pages:
-        txt = page.extract_text() or ""
-        for line in txt.split('\n'):
-            m = date_re.match(line.strip())
-            if m:
-                m1, d1, _, _, amt_str, desc = m.groups()
-                amt = float(amt_str.replace("$", "").replace(",", ""))
-                iso_date = f"{year}-{MONTH_MAP[m1.upper()]}-{int(d1):02d}"
-                txns.append({
-                    "Date": iso_date,
-                    "Description": desc.strip(),
-                    "Amount": amt,
-                    "is_deposit": amt < 0
-                })
-    return pd.DataFrame(txns)
-
-# ==========================================================
-# --- TAB 1: UPLOAD STATEMENTS & YEAR AUDIT ---
+# --- TAB 1: UPLOAD STATEMENT ---
 # ==========================================================
 with tab_upload:
     st.subheader("📥 Upload Statement (TD Bank Account or TD Visa PDF)")
@@ -238,23 +98,24 @@ with tab_upload:
         uploaded_file = st.file_uploader("Upload PDF, CSV, or Excel statement", type=["pdf", "csv", "xlsx", "xls"])
         account_type = st.selectbox("Select Account Type", ["Bank Account", "Credit Card"])
         statement_year = st.number_input("Statement Year", min_value=2024, max_value=2035, value=2026)
-        pdf_password = st.text_input("PDF Password (leave blank if none)", type="password", help="If your bank statement is password-protected, enter the password here.")
+        pdf_password = st.text_input("PDF Password (leave blank if none)", type="password", help="If password-protected, enter password here.")
 
         if uploaded_file and st.button("Process & Reconcile Statement"):
             file_bytes = uploaded_file.read()
             df = pd.DataFrame()
+            clean_pdf_bytes = None
             
             if uploaded_file.name.lower().endswith(".pdf"):
                 clean_bytes, err_msg = unlock_pdf_bytes(file_bytes, pdf_password)
                 if err_msg:
                     st.error(err_msg)
                     st.stop()
-                file_bytes = clean_bytes
+                clean_pdf_bytes = clean_bytes
 
                 if account_type == "Bank Account":
-                    df = parse_td_chequing_pdf(file_bytes, statement_year)
+                    df = parse_td_chequing_pdf(clean_pdf_bytes, statement_year)
                 else:
-                    df = parse_td_visa_pdf(file_bytes, statement_year)
+                    df = parse_td_visa_pdf(clean_pdf_bytes, statement_year)
             elif uploaded_file.name.lower().endswith(".csv"):
                 df = pd.read_csv(io.BytesIO(file_bytes))
             else:
@@ -269,6 +130,24 @@ with tab_upload:
                 amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit", "deposit"] if k in cols), None)
 
                 with engine.connect() as conn:
+                    # Save PDF copy for the Audit Tab
+                    if clean_pdf_bytes:
+                        try:
+                            sample_date = pd.to_datetime(df[date_col].iloc[0])
+                            p_label = sample_date.strftime("%b'%y")
+                        except Exception:
+                            p_label = f"M_{datetime.now().strftime('%m')}"
+                            
+                        conn.execute(text("""
+                            INSERT INTO statement_files (filename, account_type, statement_year, period_label, pdf_data)
+                            VALUES (:fn, :acc, :yr, :p, :data)
+                            ON CONFLICT (account_type, statement_year, period_label)
+                            DO UPDATE SET pdf_data = :data, filename = :fn, uploaded_at = CURRENT_TIMESTAMP
+                        """), {
+                            "fn": uploaded_file.name, "acc": account_type,
+                            "yr": statement_year, "p": p_label, "data": clean_pdf_bytes
+                        })
+
                     rules = dict(conn.execute(text("SELECT keyword, category FROM categories")).fetchall())
                     imported_count = 0
                     skipped_count = 0
@@ -289,20 +168,13 @@ with tab_upload:
                             date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
 
                         desc_nospace = desc.upper().replace(" ", "")
-
                         is_payment = 1 if any(w in desc_nospace for w in ["TDVISA", "PAYMENT-THANKYOU", "PAYMENTTHANKYOU", "CREDITCARDBILL"]) else 0
                         is_fee_rebate = "ACCTBALREBATE" in desc_nospace
 
                         if account_type == "Credit Card":
-                            if raw_amt < 0 and not is_payment:
-                                final_amt = raw_amt
-                            else:
-                                final_amt = abs(raw_amt)
+                            final_amt = raw_amt if (raw_amt < 0 and not is_payment) else abs(raw_amt)
                         else:
-                            if is_fee_rebate:
-                                final_amt = -abs(raw_amt)
-                            else:
-                                final_amt = abs(raw_amt)
+                            final_amt = -abs(raw_amt) if is_fee_rebate else abs(raw_amt)
 
                         tx_key = (date_str, desc, final_amt, account_type)
                         file_seen_counts[tx_key] = file_seen_counts.get(tx_key, 0) + 1
@@ -373,17 +245,13 @@ with tab_upload:
             
             avail_audit_years = sorted(audit_df['Year'].unique(), reverse=True)
             if 2026 not in avail_audit_years: avail_audit_years.append(2026)
-            if 2025 not in avail_audit_years: avail_audit_years.append(2025)
             avail_audit_years = sorted(list(set(avail_audit_years)), reverse=True)
             
             with c_cov_yr:
-                selected_audit_year = st.selectbox("Audit Year", options=avail_audit_years, index=avail_audit_years.index(statement_year) if statement_year in avail_audit_years else 0)
+                selected_audit_year = st.selectbox("Audit Year", options=avail_audit_years, index=0)
 
             audit_year_df = audit_df[audit_df['Year'] == selected_audit_year]
-            
-            if audit_year_df.empty:
-                st.info(f"No statements uploaded for {selected_audit_year} yet.")
-            else:
+            if not audit_year_df.empty:
                 cov = audit_year_df.groupby(['Period', 'Month', 'account_type']).size().unstack(fill_value=0).reset_index().sort_values('Period')
                 for col in ['Bank Account', 'Credit Card']:
                     if col not in cov.columns: cov[col] = 0
@@ -399,11 +267,9 @@ with tab_upload:
                 cov['Bank Account'] = cov['Bank Account'].apply(lambda x: f"✅ {x} txns" if x > 0 else "❌ Missing")
                 cov['Credit Card'] = cov['Credit Card'].apply(lambda x: f"✅ {x} txns" if x > 0 else "❌ Missing")
                 st.dataframe(cov[['Month', 'Bank Account', 'Credit Card', 'Status']], use_container_width=True, hide_index=True)
-        else:
-            st.info("No statement data logged yet.")
 
 # ==========================================================
-# --- TAB 2: EDIT & SPLIT TRANSACTIONS (DYNAMIC FILTERS) ---
+# --- TAB 2: EDIT & SPLIT TRANSACTIONS ---
 # ==========================================================
 with tab_manage:
     st.subheader("✏️ Review, Edit Categories & Split Bills")
@@ -411,86 +277,51 @@ with tab_manage:
     with engine.connect() as conn:
         all_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions ORDER BY date DESC", conn)
         cat_map = get_categories_dict(conn)
-        
         existing_cats = set(cat_map.keys()).union(set(all_tx['category'].dropna().unique()))
         assignable_cats = sorted([c for c in existing_cats if c != 'Uncategorized'])
         dropdown_cats = ['Uncategorized'] + assignable_cats
 
-    if all_tx.empty:
-        st.info("No transactions in database yet. Upload a statement first!")
-    else:
+    if not all_tx.empty:
         all_tx['date'] = pd.to_datetime(all_tx['date'])
         all_tx['Year'] = all_tx['date'].dt.year
         all_tx['Month_Str'] = all_tx['date'].dt.strftime("%b'%y")
 
-        # --- 6-Column Filter Bar ---
         f_yr, f_mo, f_acc, f_status, f_cat, f_search = st.columns([1.0, 1.1, 1.3, 1.5, 1.3, 1.8])
 
         avail_years = sorted(all_tx['Year'].unique(), reverse=True)
-        year_options = ["All Years"] + [str(y) for y in avail_years]
         with f_yr:
-            selected_yr = st.selectbox("📅 Year", options=year_options, index=0)
+            selected_yr = st.selectbox("📅 Year", options=["All Years"] + [str(y) for y in avail_years], index=0)
 
-        if selected_yr != "All Years":
-            filtered_by_yr = all_tx[all_tx['Year'] == int(selected_yr)]
-            avail_months = filtered_by_yr.sort_values('date')['Month_Str'].unique().tolist()
-        else:
-            avail_months = all_tx.sort_values('date')['Month_Str'].unique().tolist()
-
-        month_options = ["All Months"] + avail_months
+        filtered_by_yr = all_tx if selected_yr == "All Years" else all_tx[all_tx['Year'] == int(selected_yr)]
+        avail_months = filtered_by_yr.sort_values('date')['Month_Str'].unique().tolist()
+        
         with f_mo:
-            selected_mo = st.selectbox("🗓️ Month", options=month_options, index=0)
-
+            selected_mo = st.selectbox("🗓️ Month", options=["All Months"] + avail_months, index=0)
         with f_acc:
             selected_acc = st.selectbox("🏦 Account", options=["All Accounts", "Credit Card", "Bank Account", "Cash"], index=0)
 
         slice_df = all_tx.copy()
-        if selected_yr != "All Years":
-            slice_df = slice_df[slice_df['Year'] == int(selected_yr)]
-        if selected_mo != "All Months":
-            slice_df = slice_df[slice_df['Month_Str'] == selected_mo]
-        if selected_acc != "All Accounts":
-            slice_df = slice_df[slice_df['account_type'] == selected_acc]
+        if selected_yr != "All Years": slice_df = slice_df[slice_df['Year'] == int(selected_yr)]
+        if selected_mo != "All Months": slice_df = slice_df[slice_df['Month_Str'] == selected_mo]
+        if selected_acc != "All Accounts": slice_df = slice_df[slice_df['account_type'] == selected_acc]
 
         uncat_n = len(slice_df[slice_df['category'] == 'Uncategorized'])
         cat_n = len(slice_df[slice_df['category'] != 'Uncategorized'])
-        total_n = len(slice_df)
 
         with f_status:
-            status_view = st.selectbox(
-                "🏷️ Status",
-                options=[f"All ({total_n})", f"🚨 Uncategorized ({uncat_n})", f"✅ Categorized ({cat_n})"],
-                index=1 if uncat_n > 0 else 0
-            )
-
+            status_view = st.selectbox("🏷️ Status", options=[f"All ({len(slice_df)})", f"🚨 Uncategorized ({uncat_n})", f"✅ Categorized ({cat_n})"], index=1 if uncat_n > 0 else 0)
         with f_cat:
-            selected_cat_filter = st.selectbox(
-                "📂 Category",
-                options=["All Categories"] + dropdown_cats,
-                index=0
-            )
-
+            selected_cat_filter = st.selectbox("📂 Category", options=["All Categories"] + dropdown_cats, index=0)
         with f_search:
-            search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Costco, Phoenix...")
+            search_query = st.text_input("🔍 Search Merchant", placeholder="e.g. MCD, Costco...")
 
-        df_view = all_tx.copy()
-        if selected_yr != "All Years":
-            df_view = df_view[df_view['Year'] == int(selected_yr)]
-        if selected_mo != "All Months":
-            df_view = df_view[df_view['Month_Str'] == selected_mo]
-        if selected_acc != "All Accounts":
-            df_view = df_view[df_view['account_type'] == selected_acc]
-        if "Uncategorized" in status_view:
-            df_view = df_view[df_view['category'] == 'Uncategorized']
-        elif "Categorized" in status_view:
-            df_view = df_view[df_view['category'] != 'Uncategorized']
-        if selected_cat_filter != "All Categories":
-            df_view = df_view[df_view['category'] == selected_cat_filter]
-        if search_query.strip():
-            df_view = df_view[df_view['description'].str.contains(search_query.strip(), case=False, na=False)]
+        df_view = slice_df.copy()
+        if "Uncategorized" in status_view: df_view = df_view[df_view['category'] == 'Uncategorized']
+        elif "Categorized" in status_view: df_view = df_view[df_view['category'] != 'Uncategorized']
+        if selected_cat_filter != "All Categories": df_view = df_view[df_view['category'] == selected_cat_filter]
+        if search_query.strip(): df_view = df_view[df_view['description'].str.contains(search_query.strip(), case=False, na=False)]
 
         st.caption(f"Showing **{len(df_view)}** matching transactions:")
-
         h_left, h_cat, h_btn = st.columns([3.4, 1.8, 0.8])
         h_left.markdown("**Transaction Details** *(Click dropdown to split)*")
         h_cat.markdown("**Category**")
@@ -502,17 +333,10 @@ with tab_manage:
             
             with c_left:
                 with st.expander(f"📌 {row['date'].strftime('%Y-%m-%d')} | **{row['description']}** | {amt_display} ({row['account_type']})"):
-                    st.markdown("#### ✂️ Split Transaction Options")
-                    split_mode = st.radio(
-                        "Choose Split Type",
-                        ["🛒 Split into Multiple Categories (e.g. Costco: Clothes + Food)", "👥 Split with Friends (Shared Bill)"],
-                        key=f"sm_{row['id']}"
-                    )
-                    
+                    split_mode = st.radio("Choose Split Type", ["🛒 Split into Multiple Categories", "👥 Split with Friends"], key=f"sm_{row['id']}")
                     full_amt = float(abs(row['amount']))
                     
-                    if "Split into Multiple Categories" in split_mode:
-                        st.write("##### Itemize into 2 Categories")
+                    if "Multiple Categories" in split_mode:
                         sp_c1, sp_c2 = st.columns(2)
                         with sp_c1:
                             part1_amt = st.number_input("Part 1 Amount ($)", min_value=0.01, max_value=max(full_amt - 0.01, 0.02), value=round(full_amt/2, 2), step=1.0, key=f"p1_amt_{row['id']}")
@@ -522,7 +346,6 @@ with tab_manage:
                             st.metric("Part 2 Amount ($)", f"${part2_amt:.2f}")
                             part2_cat = st.selectbox("Part 2 Category", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"p2_cat_{row['id']}")
                         
-                        st.info(f"Will create: **${part1_amt:.2f}** ({part1_cat}) and **${part2_amt:.2f}** ({part2_cat}). Both remain under your budget.")
                         if st.button("Confirm Category Split", key=f"btn_catsplit_{row['id']}"):
                             with engine.connect() as conn:
                                 conn.execute(text("UPDATE transactions SET amount = :a, category = :c, description = :d WHERE id = :id"), {
@@ -532,14 +355,11 @@ with tab_manage:
                                     "d": row['date'], "desc": f"{row['description']} (Part 2 - {part2_cat})", "a": part2_amt, "c": part2_cat, "acc": row['account_type']
                                 })
                                 conn.commit()
-                            st.success("Split into 2 categories successfully!")
+                            st.success("Split completed!")
                             st.rerun()
                     else:
-                        st.write("##### Split with Friends")
-                        my_share = st.number_input("Your Personal Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
+                        my_share = st.number_input("Your Share ($)", min_value=0.0, max_value=full_amt, value=round(full_amt/2, 2), step=1.0, key=f"sp_my_{row['id']}")
                         fr_share = round(full_amt - my_share, 2)
-                        st.info(f"Friends Owe You: **${fr_share:.2f}** (Marked as `Shared Reimbursement` — will not count toward your living expenses).")
-                        
                         split_cat = st.selectbox("Category for Your Share", [c for c in assignable_cats if cat_map.get(c) == 'Expense'], key=f"sp_cat_{row['id']}")
                         
                         if st.button("Confirm Friend Split", key=f"btn_sp_{row['id']}"):
@@ -551,10 +371,8 @@ with tab_manage:
                                     "d": row['date'], "desc": f"{row['description']} (Friends Share)", "a": fr_share, "acc": row['account_type']
                                 })
                                 conn.commit()
-                            st.success("Bill split with friends successfully!")
                             st.rerun()
 
-            # Dynamic Category display and Edit/Save behavior
             edit_key = f"edit_active_{row['id']}"
             is_editing = st.session_state.get(edit_key, False)
             is_uncat = row['category'] == 'Uncategorized'
@@ -562,14 +380,7 @@ with tab_manage:
             with c_cat:
                 if is_uncat or is_editing:
                     cur_cat = row['category'] if row['category'] in dropdown_cats else 'Uncategorized'
-                    cur_idx = dropdown_cats.index(cur_cat)
-                    new_selected_cat = st.selectbox(
-                        "Category", 
-                        dropdown_cats, 
-                        index=cur_idx, 
-                        key=f"cat_sel_{row['id']}", 
-                        label_visibility="collapsed"
-                    )
+                    new_selected_cat = st.selectbox("Category", dropdown_cats, index=dropdown_cats.index(cur_cat), key=f"cat_sel_{row['id']}", label_visibility="collapsed")
                 else:
                     st.markdown(f"**`{row['category']}`**")
 
@@ -584,17 +395,14 @@ with tab_manage:
                                 })
                                 conn.commit()
                             st.session_state[edit_key] = False
-                            st.success("Saved!")
                             st.rerun()
-                        else:
-                            st.warning("Please choose a category before saving.")
                 else:
                     if st.button("Edit", key=f"btn_edit_{row['id']}"):
                         st.session_state[edit_key] = True
                         st.rerun()
 
 # ==========================================================
-# --- TAB 3: CASH WALLET LEDGER ---
+# --- TAB 3: CASH WALLET ---
 # ==========================================================
 with tab_cash:
     st.subheader("💵 Physical Cash Wallet Ledger")
@@ -627,14 +435,11 @@ with tab_cash:
                             "d": cs_date.strftime("%Y-%m-%d"), "desc": cs_desc.strip(), "a": cs_amt, "c": cs_cat
                         })
                         conn.commit()
-                    st.success("Cash expense saved!")
                     st.rerun()
 
     with cf2:
         st.write("#### 📜 Cash Outflow Log")
-        if df_cash.empty:
-            st.info("No cash spending logged yet. Unspent ATM withdrawals remain safely in your Cash in Hand.")
-        else:
+        if not df_cash.empty:
             for _, r in df_cash.iterrows():
                 h1, h2, h3, h4 = st.columns([2, 1.2, 1, 0.8])
                 h1.write(f"**{r['description']}** ({r['date']})")
@@ -647,252 +452,209 @@ with tab_cash:
                     st.rerun()
 
 # ==========================================================
-# --- TAB 4: MASTER BUDGET DASHBOARD & RECONCILIATION ---
+# --- TAB 4: MASTER BUDGET DASHBOARD ---
 # ==========================================================
 with tab_dashboard:
     with engine.connect() as conn:
         df_tx = pd.read_sql("SELECT id, date, description, amount, category, account_type, is_payment FROM transactions", conn)
         cat_map = get_categories_dict(conn)
 
-    if df_tx.empty:
-        st.info("No transactions found. Upload your bank and credit card statements to view your dashboard!")
-    else:
+    if not df_tx.empty:
         df_tx['amount'] = pd.to_numeric(df_tx['amount'], errors='coerce').fillna(0.0).astype(float)
         df_tx['date'] = pd.to_datetime(df_tx['date'])
         df_tx['Year'] = df_tx['date'].dt.year
-        df_tx['Month_Period'] = df_tx['date'].dt.to_period('M')
         df_tx['Month_Str'] = df_tx['date'].dt.strftime("%b'%y")
         df_tx['cat_type'] = df_tx['category'].map(cat_map).fillna('Expense')
 
         dash_years = sorted(df_tx['Year'].unique(), reverse=True)
-        if 2026 not in dash_years: dash_years.append(2026)
-        dash_years = sorted(list(set(dash_years)), reverse=True)
-
         d_col1, d_col2 = st.columns([1.5, 1.5])
         with d_col1:
             selected_dash_year = st.selectbox("📅 Select Budget Year", options=dash_years, index=0)
 
         df_tx_year = df_tx[df_tx['Year'] == selected_dash_year]
-        all_months = df_tx_year.sort_values('date')[['Month_Period', 'Month_Str']].drop_duplicates()['Month_Str'].tolist()
+        all_months = df_tx_year.sort_values('date')[['date', 'Month_Str']].drop_duplicates()['Month_Str'].tolist()
 
-        if not all_months:
-            st.info(f"No transactions recorded for {selected_dash_year} yet.")
-        else:
-            ordered_cats = [
-                'Food', 'Utilities', 'Va-Al-SM', 'Transportation', 'Entertainment',
-                'Cell Phone', 'Clothes', 'Rent', 'Savings', 'Ria', 'Cash',
-                'Citizenship', 'India', 'Misc', 'Health'
-            ]
-            
-            # Combine preset categories with any custom expense categories in the database
-            all_known_cats = [c for c in ordered_cats] + [
-                c for c in df_tx_year['category'].unique() 
-                if c not in ordered_cats 
-                and c not in ['Uncategorized', 'Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']
-                and cat_map.get(c) == 'Expense'
-            ]
-            seen_c = set()
-            cats_to_evaluate = [c for c in all_known_cats if not (c in seen_c or seen_c.add(c))]
+        if all_months:
+            ordered_cats = ['Food', 'Utilities', 'Va-Al-SM', 'Transportation', 'Entertainment', 'Cell Phone', 'Clothes', 'Rent', 'Savings', 'Ria', 'Cash', 'Citizenship', 'India', 'Misc', 'Health']
+            all_known_cats = ordered_cats + [c for c in df_tx_year['category'].unique() if c not in ordered_cats and c not in ['Uncategorized', 'Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement'] and cat_map.get(c) == 'Expense']
+            seen = set()
+            cats_eval = [c for c in all_known_cats if not (c in seen or seen.add(c))]
 
-            # --- 1. TABLE 1: MASTER CATEGORY OUTFLOWS ---
-            t1_head, t1_ctrl = st.columns([2.2, 1.3])
-            with t1_head:
-                st.subheader(f"📋 1. {selected_dash_year} Master Category Outflows")
-            with t1_ctrl:
-                sort_highest = st.checkbox("⬇️ Sort categories from highest to lowest spend", value=False)
+            # 1. Category Outflows
+            t1_h, t1_c = st.columns([2.2, 1.3])
+            with t1_h: st.subheader(f"📋 1. {selected_dash_year} Master Category Outflows")
+            with t1_c: sort_highest = st.checkbox("⬇️ Sort categories from highest to lowest spend", value=False)
 
             pivot_data = []
-            for cat in cats_to_evaluate:
+            for cat in cats_eval:
                 cat_rows = df_tx_year[df_tx_year['category'] == cat]
                 row_dict = {'Type': cat}
                 for m in all_months:
-                    val = cat_rows[cat_rows['Month_Str'] == m]['amount'].sum()
-                    row_dict[m] = round(val, 2)
+                    row_dict[m] = round(cat_rows[cat_rows['Month_Str'] == m]['amount'].sum(), 2)
                 row_total = round(sum([row_dict[m] for m in all_months]), 2)
                 row_dict['Total'] = row_total
-                
-                # Rule 1: Exclude categories where total spending is 0
-                if row_total > 0:
-                    pivot_data.append(row_dict)
+                if row_total > 0: pivot_data.append(row_dict)
 
-            # Rule 2: Sort descending if requested
-            if sort_highest:
-                pivot_data = sorted(pivot_data, key=lambda x: x['Total'], reverse=True)
+            if sort_highest: pivot_data = sorted(pivot_data, key=lambda x: x['Total'], reverse=True)
 
-            # Rule 3: Bottom Total Row pinned at the bottom
-            total_outflows_row = {'Type': 'Total'}
-            for m in all_months:
-                total_outflows_row[m] = round(sum(r[m] for r in pivot_data), 2)
-            total_outflows_row['Total'] = round(sum(r['Total'] for r in pivot_data), 2)
+            tot_out_row = {'Type': 'Total'}
+            for m in all_months: tot_out_row[m] = round(sum(r[m] for r in pivot_data), 2)
+            tot_out_row['Total'] = round(sum(r['Total'] for r in pivot_data), 2)
 
-            display_table_1 = pivot_data + [total_outflows_row]
-            grid_df = pd.DataFrame(display_table_1).set_index('Type')
+            grid_df = pd.DataFrame(pivot_data + [tot_out_row]).set_index('Type')
             st.dataframe(grid_df.style.format("${:,.2f}"), use_container_width=True)
 
-            # --- 2. TABLE 2: INVESTMENTS, SAVINGS & REMITTANCES BREAKDOWN ---
+            # 2. Savings & Investments Breakdown
             st.subheader("💰 2. Investments, Savings & Remittances Breakdown")
-            
             def classify_savings(row):
-                desc = str(row['description']).upper().replace(" ", "")
-                cat = str(row['category']).upper().replace(" ", "")
-                if 'FHSA' in cat or 'FHSA' in desc:
-                    return 'FHSA'
-                elif 'TFSA' in cat or 'TFSA' in desc or 'TFS' in desc:
-                    return 'TFSA'
-                elif any(k in cat or k in desc for k in ['RIA', 'INDIA', 'REMITTANCE']):
-                    return 'Sent to India (Ria)'
-                elif 'SAVING' in cat or 'INV' in desc or 'INVEST' in cat:
-                    return 'Other Savings / Investments'
+                d = str(row['description']).upper().replace(" ", "")
+                c = str(row['category']).upper().replace(" ", "")
+                if 'FHSA' in c or 'FHSA' in d: return 'FHSA'
+                elif 'TFSA' in c or 'TFSA' in d or 'TFS' in d: return 'TFSA'
+                elif any(k in c or k in d for k in ['RIA', 'INDIA', 'REMITTANCE']): return 'Sent to India (Ria)'
+                elif 'SAVING' in c or 'INV' in d or 'INVEST' in c: return 'Other Savings / Investments'
                 return None
 
             df_tx_year['savings_goal'] = df_tx_year.apply(classify_savings, axis=1)
-
-            savings_assets = ['TFSA', 'FHSA', 'Sent to India (Ria)', 'Other Savings / Investments']
-            savings_pivot = []
-            for asset in savings_assets:
-                sub_rows = df_tx_year[df_tx_year['savings_goal'] == asset]
+            sav_pivot = []
+            for asset in ['TFSA', 'FHSA', 'Sent to India (Ria)', 'Other Savings / Investments']:
+                sub_r = df_tx_year[df_tx_year['savings_goal'] == asset]
                 s_dict = {'Asset / Goal': asset}
-                for m in all_months:
-                    s_dict[m] = round(sub_rows[sub_rows['Month_Str'] == m]['amount'].sum(), 2)
+                for m in all_months: s_dict[m] = round(sub_r[sub_r['Month_Str'] == m]['amount'].sum(), 2)
                 s_dict['Total'] = round(sum([s_dict[m] for m in all_months]), 2)
-                savings_pivot.append(s_dict)
+                sav_pivot.append(s_dict)
 
-            total_savings_row = {'Asset / Goal': 'Total Saved & Invested'}
-            for m in all_months:
-                total_savings_row[m] = round(sum(r[m] for r in savings_pivot), 2)
-            total_savings_row['Total'] = round(sum(r['Total'] for r in savings_pivot), 2)
+            tot_sav_row = {'Asset / Goal': 'Total Saved & Invested'}
+            for m in all_months: tot_sav_row[m] = round(sum(r[m] for r in sav_pivot), 2)
+            tot_sav_row['Total'] = round(sum(r['Total'] for r in sav_pivot), 2)
 
-            display_savings = savings_pivot + [total_savings_row]
-            savings_df = pd.DataFrame(display_savings).set_index('Asset / Goal')
+            savings_df = pd.DataFrame(sav_pivot + [tot_sav_row]).set_index('Asset / Goal')
             st.dataframe(savings_df.style.format("${:,.2f}"), use_container_width=True)
 
-            # --- 3. TABLE 3: MONTHLY FINANCIAL SUMMARY ---
+            # 3. Monthly Financial Summary
             st.subheader("💵 3. Monthly Financial Summary")
-            
-            income_row = {'Metric': 'Total Income'}
-            total_spent_row = {'Metric': 'Total Spent'}
-            actual_spent_row = {'Metric': 'Actual Spent (Excl. Savings & Ria)'}
-            left_row = {'Metric': 'Net Left (Savings Balance)'}
+            inc_row = {'Metric': 'Total Income'}
+            tsp_row = {'Metric': 'Total Spent'}
+            act_row = {'Metric': 'Actual Spent (Excl. Savings & Ria)'}
+            net_row = {'Metric': 'Net Left (Savings Balance)'}
 
             df_inc = df_tx_year[df_tx_year['cat_type'] == 'Income']
-
             for m in all_months:
-                tot = total_outflows_row[m]
-                sav_ria = total_savings_row[m]
+                tot = tot_out_row[m]
+                sav = tot_sav_row[m]
                 inc = df_inc[df_inc['Month_Str'] == m]['amount'].sum()
+                inc_row[m] = round(inc, 2)
+                tsp_row[m] = round(tot, 2)
+                act_row[m] = round(tot - sav, 2)
+                net_row[m] = round(inc - tot, 2)
 
-                income_row[m] = round(inc, 2)
-                total_spent_row[m] = round(tot, 2)
-                actual_spent_row[m] = round(tot - sav_ria, 2)
-                left_row[m] = round(inc - tot, 2)
+            inc_row['Total'] = round(sum([inc_row[m] for m in all_months]), 2)
+            tsp_row['Total'] = round(sum([tsp_row[m] for m in all_months]), 2)
+            act_row['Total'] = round(sum([act_row[m] for m in all_months]), 2)
+            net_row['Total'] = round(inc_row['Total'] - tsp_row['Total'], 2)
 
-            income_row['Total'] = round(sum([income_row[m] for m in all_months]), 2)
-            total_spent_row['Total'] = round(sum([total_spent_row[m] for m in all_months]), 2)
-            actual_spent_row['Total'] = round(sum([actual_spent_row[m] for m in all_months]), 2)
-            left_row['Total'] = round(income_row['Total'] - total_spent_row['Total'], 2)
-
-            # Reordered as requested: Total Income -> Total Spent -> Actual Spent -> Net Left
-            summary_df = pd.DataFrame([income_row, total_spent_row, actual_spent_row, left_row]).set_index('Metric')
+            summary_df = pd.DataFrame([inc_row, tsp_row, act_row, net_row]).set_index('Metric')
             st.dataframe(summary_df.style.format("${:,.2f}"), use_container_width=True)
 
-            # --- 4. TABLE 4: PAYMENT SOURCES & RECONCILIATION AUDIT ---
+            # 4. Reconciliation
             st.subheader("⚖️ 4. Payment Sources & Reconciliation Audit")
-            
             cc_row = {'Source': 'Credit Card'}
             ba_row = {'Source': 'Bank Account'}
-            cash_acc_row = {'Source': 'Cash'}
-            outflow_sum_row = {'Source': 'Total Account Outflows'}
-            recon_status_row = {'Source': 'Reconciliation Status'}
+            ca_row = {'Source': 'Cash'}
+            out_sum_row = {'Source': 'Total Account Outflows'}
+            rec_stat_row = {'Source': 'Reconciliation Status'}
 
             for m in all_months:
                 m_tx = df_tx_year[df_tx_year['Month_Str'] == m]
-                
                 cc_val = m_tx[(m_tx['account_type'] == 'Credit Card') & (m_tx['is_payment'] == 0)]['amount'].sum()
-                
-                ba_val = m_tx[
-                    (m_tx['account_type'] == 'Bank Account') & 
-                    (m_tx['cat_type'] != 'Income') & 
-                    (m_tx['is_payment'] == 0) & 
-                    (~m_tx['category'].isin(['Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']))
-                ]['amount'].sum()
-                
-                cash_val = m_tx[m_tx['account_type'] == 'Cash']['amount'].sum()
+                ba_val = m_tx[(m_tx['account_type'] == 'Bank Account') & (m_tx['cat_type'] != 'Income') & (m_tx['is_payment'] == 0) & (~m_tx['category'].isin(['Payment', 'Internal Transfer', 'Bank Acc Charges', 'Shared Reimbursement']))]['amount'].sum()
+                ca_val = m_tx[m_tx['account_type'] == 'Cash']['amount'].sum()
 
                 cc_row[m] = round(cc_val, 2)
                 ba_row[m] = round(ba_val, 2)
-                cash_acc_row[m] = round(cash_val, 2)
-                
-                tot_outflows = round(cc_val + ba_val + cash_val, 2)
-                outflow_sum_row[m] = tot_outflows
-                
-                is_reconciled = abs(total_spent_row[m] - tot_outflows) < 0.05
-                recon_status_row[m] = "✅ Correct" if is_reconciled else "⚠️ Check Data"
+                ca_row[m] = round(ca_val, 2)
+                t_out = round(cc_val + ba_val + ca_val, 2)
+                out_sum_row[m] = t_out
+                rec_stat_row[m] = "✅ Correct" if abs(tsp_row[m] - t_out) < 0.05 else "⚠️ Check Data"
 
             cc_row['Total'] = round(sum([cc_row[m] for m in all_months]), 2)
             ba_row['Total'] = round(sum([ba_row[m] for m in all_months]), 2)
-            cash_acc_row['Total'] = round(sum([cash_acc_row[m] for m in all_months]), 2)
-            outflow_sum_row['Total'] = round(sum([outflow_sum_row[m] for m in all_months]), 2)
-            recon_status_row['Total'] = "✅ Correct" if abs(total_spent_row['Total'] - outflow_sum_row['Total']) < 0.05 else "⚠️ Check Data"
+            ca_row['Total'] = round(sum([ca_row[m] for m in all_months]), 2)
+            out_sum_row['Total'] = round(sum([out_sum_row[m] for m in all_months]), 2)
+            rec_stat_row['Total'] = "✅ Correct" if abs(tsp_row['Total'] - out_sum_row['Total']) < 0.05 else "⚠️ Check Data"
 
-            recon_df = pd.DataFrame([cc_row, ba_row, cash_acc_row, outflow_sum_row, recon_status_row]).set_index('Source')
-            
-            def format_recon(val):
-                if isinstance(val, (int, float)):
-                    return f"${val:,.2f}"
-                return str(val)
+            recon_df = pd.DataFrame([cc_row, ba_row, ca_row, out_sum_row, rec_stat_row]).set_index('Source')
+            st.dataframe(recon_df.map(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else str(x)), use_container_width=True)
 
-            st.dataframe(recon_df.map(format_recon), use_container_width=True)
-
-            # --- EXCEL DOWNLOAD BUTTON ---
             with d_col2:
                 st.write("")
                 st.write("")
                 excel_bytes = generate_excel_report(selected_dash_year, grid_df, savings_df, summary_df, recon_df, df_tx_year)
-                st.download_button(
-                    label=f"📥 Download {selected_dash_year} Budget Report (.xlsx)",
-                    data=excel_bytes,
-                    file_name=f"{selected_dash_year}_Budget_Report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-
-            # --- 5. CATEGORY MONTH-ON-MONTH DRILLDOWN ---
-            st.markdown("---")
-            st.subheader("📈 Category Month-on-Month Drilldown")
-            
-            cd_col1, cd_col2 = st.columns([1.5, 1.5])
-            with cd_col1:
-                selectable_drill_cats = [c for c in grid_df.index if c != 'Total']
-                inspect_cat = st.selectbox("Select Category to Analyze", options=selectable_drill_cats)
-            with cd_col2:
-                month_filter_options = ["All Months"] + all_months
-                drilldown_month = st.selectbox("🗓️ Filter Transactions by Month", options=month_filter_options, index=0)
-
-            c_ch1, c_ch2 = st.columns([1.5, 1.5])
-            with c_ch1:
-                st.write(f"#### {inspect_cat} Spending Trajectory")
-                st.bar_chart(grid_df.loc[inspect_cat, all_months])
-            with c_ch2:
-                st.write(f"#### {inspect_cat} Transactions ({drilldown_month})")
-                sub_tx = df_tx_year[df_tx_year['category'] == inspect_cat]
-                if drilldown_month != "All Months":
-                    sub_tx = sub_tx[sub_tx['Month_Str'] == drilldown_month]
-                    
-                sub_tx = sub_tx.sort_values('date', ascending=False)
-                if not sub_tx.empty:
-                    st.dataframe(
-                        sub_tx[['date', 'description', 'amount', 'account_type']]
-                        .assign(Date=lambda x: x['date'].dt.strftime('%Y-%m-%d'))
-                        [['Date', 'description', 'amount', 'account_type']]
-                        .rename(columns={'description': 'Merchant', 'amount': 'Amount ($)', 'account_type': 'Account'})
-                        .style.format({'Amount ($)': "${:,.2f}"}),
-                        use_container_width=True, hide_index=True
-                    )
-                else:
-                    st.info(f"No {inspect_cat} transactions found for {drilldown_month}.")
+                st.download_button(f"📥 Download {selected_dash_year} Budget Report (.xlsx)", excel_bytes, f"{selected_dash_year}_Budget_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 # ==========================================================
-# --- TAB 5: RULES & MASTER CATEGORIES ---
+# --- TAB 5: DEDICATED PDF STATEMENT AUDIT VIEWER ---
+# ==========================================================
+with tab_audit:
+    st.subheader("📄 Interactive PDF Statement Audit & Verification")
+    
+    with engine.connect() as conn:
+        saved_files = conn.execute(text("SELECT id, filename, account_type, statement_year, period_label FROM statement_files ORDER BY statement_year DESC, period_label DESC")).fetchall()
+    
+    if not saved_files:
+        st.info("No saved statements found in the database. When you upload a statement in Tab 1, a copy will be archived here automatically!")
+    else:
+        file_options = {f"{r[3]} {r[4]} | {r[2]} ({r[1]})": r[0] for r in saved_files}
+        chosen_label = st.selectbox("Select Statement to Audit", list(file_options.keys()))
+        selected_file_id = file_options[chosen_label]
+
+        with engine.connect() as conn:
+            file_rec = conn.execute(text("SELECT filename, account_type, statement_year, period_label, pdf_data FROM statement_files WHERE id = :id"), {"id": selected_file_id}).fetchone()
+        
+        if file_rec:
+            fname, a_type, s_year, s_period, p_bytes = file_rec
+            col_pdf, col_data = st.columns([1.2, 1])
+
+            with col_pdf:
+                st.markdown(f"#### 📑 Statement Document: `{fname}`")
+                st.download_button("📥 Download This PDF", p_bytes, fname, "application/pdf")
+                
+                # Embed the interactive browser PDF viewer
+                b64_pdf = base64.b64encode(p_bytes).decode('utf-8')
+                pdf_embed_html = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="820" type="application/pdf" style="border: 1px solid #444; border-radius: 8px;"></iframe>'
+                st.markdown(pdf_embed_html, unsafe_allow_html=True)
+
+            with col_data:
+                st.markdown(f"#### 🔍 Extracted Data in App ({s_period})")
+                
+                with engine.connect() as conn:
+                    matched_tx = pd.read_sql("""
+                        SELECT date, description, amount, category 
+                        FROM transactions 
+                        WHERE account_type = :acc 
+                          AND EXTRACT(YEAR FROM date) = :yr
+                          AND TO_CHAR(date, 'Mon''YY') = :period
+                        ORDER BY date ASC
+                    """, conn, params={"acc": a_type, "yr": s_year, "period": s_period})
+
+                if matched_tx.empty:
+                    st.warning(f"No transactions found for {s_period} in {a_type}. Try re-uploading this statement in Tab 1.")
+                else:
+                    k1, k2 = st.columns(2)
+                    k1.metric("Logged Transactions", len(matched_tx))
+                    k2.metric("Total Account Outflow", f"${matched_tx['amount'].sum():,.2f}")
+                    
+                    st.dataframe(
+                        matched_tx.assign(Date=lambda x: pd.to_datetime(x['date']).dt.strftime('%Y-%m-%d'))
+                        [['Date', 'description', 'amount', 'category']]
+                        .rename(columns={'description': 'Merchant / Description', 'amount': 'Amount ($)', 'category': 'Category'})
+                        .style.format({'Amount ($)': "${:,.2f}"}),
+                        use_container_width=True,
+                        height=750
+                    )
+
+# ==========================================================
+# --- TAB 6: RULES & MASTER CATEGORIES ---
 # ==========================================================
 with tab_rules:
     st.subheader("⚙️ Rules & Vendor Keyword Engine")
