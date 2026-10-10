@@ -5,7 +5,7 @@ import base64
 from datetime import datetime
 from sqlalchemy import create_engine, text
 
-# Import the parsing engines from our modular parsers.py
+# Import the parsing engines from parsers.py
 from parsers import parse_td_chequing_pdf, parse_td_visa_pdf, unlock_pdf_bytes
 
 # Database Configuration
@@ -21,7 +21,6 @@ st.title("💳 Personal Finance & Master Reconciliation Hub")
 # Auto-setup tables and perform database integrity fixes
 with engine.connect() as conn:
     conn.execute(text("""
-        -- Dedicated table for saving original PDF statements
         CREATE TABLE IF NOT EXISTS statement_files (
             id SERIAL PRIMARY KEY,
             filename TEXT,
@@ -617,10 +616,9 @@ with tab_audit:
 
             with col_pdf:
                 st.markdown(f"#### 📑 Statement Document: `{fname}`")
-                st.download_button("📥 Download This PDF", p_bytes, fname, "application/pdf")
+                st.download_button("📥 Download This PDF", bytes(p_bytes), fname, "application/pdf")
                 
-                # Embed the interactive browser PDF viewer
-                b64_pdf = base64.b64encode(p_bytes).decode('utf-8')
+                b64_pdf = base64.b64encode(bytes(p_bytes)).decode('utf-8')
                 pdf_embed_html = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="820" type="application/pdf" style="border: 1px solid #444; border-radius: 8px;"></iframe>'
                 st.markdown(pdf_embed_html, unsafe_allow_html=True)
 
@@ -628,14 +626,18 @@ with tab_audit:
                 st.markdown(f"#### 🔍 Extracted Data in App ({s_period})")
                 
                 with engine.connect() as conn:
-                    matched_tx = pd.read_sql("""
-                        SELECT date, description, amount, category 
-                        FROM transactions 
-                        WHERE account_type = :acc 
-                          AND EXTRACT(YEAR FROM date) = :yr
-                          AND TO_CHAR(date, 'Mon''YY') = :period
-                        ORDER BY date ASC
-                    """, conn, params={"acc": a_type, "yr": s_year, "period": s_period})
+                    matched_tx = pd.read_sql(
+                        text("SELECT date, description, amount, category FROM transactions WHERE account_type = :acc ORDER BY date ASC"),
+                        conn,
+                        params={"acc": a_type}
+                    )
+
+                if not matched_tx.empty:
+                    matched_tx['date_dt'] = pd.to_datetime(matched_tx['date'])
+                    matched_tx = matched_tx[
+                        (matched_tx['date_dt'].dt.year == int(s_year)) &
+                        (matched_tx['date_dt'].dt.strftime("%b'%y") == s_period)
+                    ]
 
                 if matched_tx.empty:
                     st.warning(f"No transactions found for {s_period} in {a_type}. Try re-uploading this statement in Tab 1.")
