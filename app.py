@@ -6,7 +6,7 @@ import base64
 from datetime import datetime
 from sqlalchemy import create_engine, text
 
-# Import the parsing engines from parsers.py
+# Import parsing engines from modular parsers.py
 from parsers import parse_td_chequing_pdf, parse_td_visa_pdf, unlock_pdf_bytes
 
 # Database Configuration
@@ -19,7 +19,7 @@ engine = create_engine(
 st.set_page_config(page_title="Personal Finance Hub", layout="wide", page_icon="💳")
 st.title("💳 Personal Finance & Master Reconciliation Hub")
 
-# Auto-setup tables and perform database integrity fixes
+# Auto-setup tables, deduplicate, and perform integrity fixes on startup
 with engine.connect() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS statement_files (
@@ -39,6 +39,23 @@ with engine.connect() as conn:
             ('FHSA', 'Expense')
         ON CONFLICT (name) DO NOTHING;
 
+        -- 1. Automatic Deduplication: Remove re-upload duplicates where date, amount, account match
+        DELETE FROM transactions
+        WHERE id IN (
+            SELECT a.id
+            FROM transactions a
+            JOIN transactions b ON a.id > b.id
+              AND a.date = b.date
+              AND a.amount = b.amount
+              AND a.account_type = b.account_type
+              AND (
+                REPLACE(REPLACE(UPPER(a.description), ' ', ''), '_', '') = REPLACE(REPLACE(UPPER(b.description), ' ', ''), '_', '')
+                OR (a.description ILIKE '%GST%' AND b.description ILIKE '%GST%')
+                OR (a.description ILIKE '%RIA%' AND b.description ILIKE '%RIA%')
+              )
+        );
+
+        -- 2. Standardize payments and vendor classifications
         UPDATE transactions 
         SET category = 'Payment', is_payment = 1 
         WHERE (description ILIKE '%TD VISA%' 
@@ -130,7 +147,7 @@ with tab_upload:
                 amt_col = next((cols[k] for k in ["amount", "cost", "withdrawal", "debit", "deposit"] if k in cols), None)
 
                 with engine.connect() as conn:
-                    # Save PDF copy for the Audit Tab
+                    # Save PDF archive
                     if clean_pdf_bytes:
                         try:
                             sample_date = pd.to_datetime(df[date_col].iloc[0])
@@ -167,7 +184,7 @@ with tab_upload:
                         except Exception:
                             date_str = pd.to_datetime("today").strftime("%Y-%m-%d")
 
-                        desc_nospace = desc.upper().replace(" ", "")
+                        desc_nospace = desc.upper().replace(" ", "").replace("_", "")
                         is_payment = 1 if any(w in desc_nospace for w in ["TDVISA", "PAYMENT-THANKYOU", "PAYMENTTHANKYOU", "CREDITCARDBILL"]) else 0
                         is_fee_rebate = "ACCTBALREBATE" in desc_nospace
 
@@ -176,14 +193,25 @@ with tab_upload:
                         else:
                             final_amt = -abs(raw_amt) if is_fee_rebate else abs(raw_amt)
 
-                        tx_key = (date_str, desc, final_amt, account_type)
+                        tx_key = (date_str, desc_nospace, final_amt, account_type)
                         file_seen_counts[tx_key] = file_seen_counts.get(tx_key, 0) + 1
                         current_occurrence = file_seen_counts[tx_key]
 
+                        # Normalized duplicate detection prevents variations from causing duplicate inserts
                         db_count = conn.execute(text("""
                             SELECT COUNT(*) FROM transactions 
-                            WHERE date = :date AND description = :desc AND amount = :amt AND account_type = :acc
-                        """), {"date": date_str, "desc": desc, "amt": final_amt, "acc": account_type}).scalar()
+                            WHERE date = :date 
+                              AND amount = :amt 
+                              AND account_type = :acc
+                              AND (
+                                description = :desc
+                                OR REPLACE(REPLACE(UPPER(description), ' ', ''), '_', '') = :norm_desc
+                                OR (description ILIKE '%GST%' AND :desc ILIKE '%GST%')
+                              )
+                        """), {
+                            "date": date_str, "desc": desc, "norm_desc": desc_nospace, 
+                            "amt": final_amt, "acc": account_type
+                        }).scalar()
 
                         if db_count >= current_occurrence:
                             skipped_count += 1
@@ -322,14 +350,15 @@ with tab_manage:
         if search_query.strip(): df_view = df_view[df_view['description'].str.contains(search_query.strip(), case=False, na=False)]
 
         st.caption(f"Showing **{len(df_view)}** matching transactions:")
-        h_left, h_cat, h_btn = st.columns([3.4, 1.8, 0.8])
+        h_left, h_cat, h_btn, h_del = st.columns([3.2, 1.6, 0.8, 0.6])
         h_left.markdown("**Transaction Details** *(Click dropdown to split)*")
         h_cat.markdown("**Category**")
         h_btn.markdown("**Action**")
+        h_del.markdown("**Remove**")
 
         for _, row in df_view.iterrows():
             amt_display = f"${float(row['amount']):.2f}"
-            c_left, c_cat, c_btn = st.columns([3.4, 1.8, 0.8])
+            c_left, c_cat, c_btn, c_del = st.columns([3.2, 1.6, 0.8, 0.6])
             
             with c_left:
                 with st.expander(f"📌 {row['date'].strftime('%Y-%m-%d')} | **{row['description']}** | {amt_display} ({row['account_type']})"):
@@ -400,6 +429,13 @@ with tab_manage:
                     if st.button("Edit", key=f"btn_edit_{row['id']}"):
                         st.session_state[edit_key] = True
                         st.rerun()
+
+            with c_del:
+                if st.button("🗑️", key=f"del_tx_{row['id']}", help="Delete transaction"):
+                    with engine.connect() as conn:
+                        conn.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": row['id']})
+                        conn.commit()
+                    st.rerun()
 
 # ==========================================================
 # --- TAB 3: CASH WALLET ---
@@ -619,17 +655,16 @@ with tab_audit:
                 st.markdown(f"#### 📑 Statement Document: `{fname}`")
                 st.download_button("📥 Download This PDF", bytes(p_bytes), fname, "application/pdf")
                 
-                # Render using PyMuPDF if available, otherwise fallback to HTML5 canvas
                 rendered = False
                 try:
-                    import fitz  # PyMuPDF
+                    import fitz
                     doc = fitz.open(stream=bytes(p_bytes), filetype="pdf")
                     for pno in range(len(doc)):
                         page = doc[pno]
                         pix = page.get_pixmap(dpi=150)
                         st.image(pix.tobytes("png"), caption=f"Page {pno + 1}", use_container_width=True)
                     rendered = True
-                except ImportError:
+                except Exception:
                     rendered = False
 
                 if not rendered:
@@ -685,7 +720,7 @@ with tab_audit:
                 
                 with engine.connect() as conn:
                     matched_tx = pd.read_sql(
-                        text("SELECT date, description, amount, category FROM transactions WHERE account_type = :acc ORDER BY date ASC"),
+                        text("SELECT id, date, description, amount, category FROM transactions WHERE account_type = :acc ORDER BY date ASC"),
                         conn,
                         params={"acc": a_type}
                     )
@@ -698,7 +733,7 @@ with tab_audit:
                     ]
 
                 if matched_tx.empty:
-                    st.warning(f"No transactions found for {s_period} in {a_type}. Try re-uploading this statement in Tab 1.")
+                    st.warning(f"No transactions found for {s_period} in {a_type}.")
                 else:
                     k1, k2 = st.columns(2)
                     k1.metric("Logged Transactions", len(matched_tx))
